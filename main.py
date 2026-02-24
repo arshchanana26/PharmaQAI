@@ -101,7 +101,46 @@ st.markdown(f"""
       background-color: {PALETTE['panel']};
       border-right: 1px solid {PALETTE['border']};
   }}
-  h1, h2, h3 {{ font-family: 'IBM Plex Mono', monospace; letter-spacing: -0.03em; }}
+  /* Force ALL text white/light everywhere */
+  *, *::before, *::after {{
+      color: {PALETTE['text']};
+  }}
+  h1, h2, h3 {{
+      font-family: 'IBM Plex Mono', monospace;
+      letter-spacing: -0.03em;
+      color: {PALETTE['text']} !important;
+  }}
+
+  /* Sidebar — every element forced light */
+  section[data-testid="stSidebar"] * {{
+      color: {PALETTE['text']} !important;
+  }}
+  section[data-testid="stSidebar"] p,
+  section[data-testid="stSidebar"] span,
+  section[data-testid="stSidebar"] label,
+  section[data-testid="stSidebar"] div {{
+      color: {PALETTE['text']} !important;
+  }}
+  /* Radio labels */
+  div[role="radiogroup"] label p,
+  div[role="radiogroup"] label span {{
+      color: {PALETTE['text']} !important;
+  }}
+  /* File uploader inner text */
+  .stFileUploader span, .stFileUploader p, .stFileUploader label {{
+      color: {PALETTE['text']} !important;
+  }}
+
+  /* Widget labels everywhere */
+  label, .stSelectbox label p, .stMultiSelect label p,
+  .stSlider label p, .stTextInput label p {{
+      color: {PALETTE['text']} !important;
+  }}
+  /* Selectbox selected value text */
+  div[data-baseweb="select"] span {{
+      color: {PALETTE['text']} !important;
+  }}
+
   .metric-card {{
       background: {PALETTE['panel']};
       border: 1px solid {PALETTE['border']};
@@ -112,18 +151,18 @@ st.markdown(f"""
   .metric-value {{
       font-family: 'IBM Plex Mono', monospace;
       font-size: 1.6rem;
-      color: {PALETTE['accent1']};
+      color: {PALETTE['accent1']} !important;
   }}
   .metric-label {{
       font-size: 0.75rem;
-      color: {PALETTE['muted']};
+      color: {PALETTE['muted']} !important;
       text-transform: uppercase;
       letter-spacing: 0.08em;
   }}
   .tag {{
       display: inline-block;
       background: {PALETTE['border']};
-      color: {PALETTE['accent1']};
+      color: {PALETTE['accent1']} !important;
       font-family: 'IBM Plex Mono', monospace;
       font-size: 0.7rem;
       padding: 2px 8px;
@@ -133,7 +172,7 @@ st.markdown(f"""
   hr {{ border-color: {PALETTE['border']}; }}
   .stButton > button {{
       background: {PALETTE['accent1']};
-      color: {PALETTE['bg']};
+      color: {PALETTE['bg']} !important;
       border: none;
       border-radius: 6px;
       font-family: 'IBM Plex Mono', monospace;
@@ -143,6 +182,7 @@ st.markdown(f"""
       transition: opacity 0.15s;
   }}
   .stButton > button:hover {{ opacity: 0.85; }}
+  .stAlert p {{ color: {PALETTE['text']} !important; }}
 </style>
 """, unsafe_allow_html=True)
 
