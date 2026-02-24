@@ -1,567 +1,716 @@
-# main.py
-# Streamlit app: ML-based prediction of tablet quality attributes from manufacturing data
-# Loads CSV from repository (no upload required), trains models, interactive plots + contour exploration.
-
-from __future__ import annotations
-
-from pathlib import Path
-from typing import List, Tuple, Optional, Dict
-
-import numpy as np
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+from matplotlib import cm
+from matplotlib.gridspec import GridSpec
+import warnings
+warnings.filterwarnings("ignore")
 
-from sklearn.model_selection import train_test_split
-from sklearn.compose import ColumnTransformer
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
-    r2_score,
-    mean_absolute_error,
-    mean_squared_error,
-    accuracy_score,
-    roc_auc_score,
-    classification_report,
-    confusion_matrix,
+    mean_squared_error, r2_score, mean_absolute_error,
+    accuracy_score, classification_report, confusion_matrix,
+    roc_auc_score, roc_curve
 )
-from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
-from sklearn.linear_model import ElasticNet, LogisticRegression
-from sklearn.inspection import permutation_importance
 
-import plotly.express as px
-import plotly.graph_objects as go
+# Regression models
+from sklearn.linear_model import Ridge, Lasso, ElasticNet
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, ExtraTreesRegressor
+from sklearn.svm import SVR
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.cross_decomposition import PLSRegression
 
+# Classification models
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.svm import SVC
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 
-# -----------------------------
-# App config
-# -----------------------------
-st.set_page_config(page_title="PharmaQualityAI", layout="wide")
+import io
 
-DATA_FILENAME = "Process (1).csv"  # keep exactly as committed in repo
-DATA_PATH = Path(__file__).resolve().parent / DATA_FILENAME
+# ─────────────────────────────────────────────────────────────────────────────
+# PAGE CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="PharmaQAI — Process Intelligence",
+    page_icon="",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-KNOWN_CQA_TARGETS = [
-    "Drug release average (%)",
-    "Drug release min (%)",
-    "Residual solvent",
-    "Total impurities",
-    "Impurity O",
-    "Impurity L",
-]
+# ─────────────────────────────────────────────────────────────────────────────
+# GLOBAL STYLE
+# ─────────────────────────────────────────────────────────────────────────────
+PALETTE = {
+    "bg":        "#0d1117",
+    "panel":     "#161b22",
+    "border":    "#30363d",
+    "accent1":   "#58a6ff",
+    "accent2":   "#3fb950",
+    "accent3":   "#f78166",
+    "accent4":   "#d2a8ff",
+    "accent5":   "#ffa657",
+    "text":      "#e6edf3",
+    "muted":     "#8b949e",
+}
 
-ID_COLS = {"batch", "code"}  # identifier columns (never used as targets)
+CMAP_CONTOUR  = "plasma"
+CMAP_HEATMAP  = "viridis"
+CMAP_SCATTER  = "coolwarm"
 
+MPL_STYLE = {
+    "figure.facecolor":     PALETTE["bg"],
+    "axes.facecolor":       PALETTE["panel"],
+    "axes.edgecolor":       PALETTE["border"],
+    "axes.labelcolor":      PALETTE["text"],
+    "axes.titlecolor":      PALETTE["text"],
+    "xtick.color":          PALETTE["muted"],
+    "ytick.color":          PALETTE["muted"],
+    "text.color":           PALETTE["text"],
+    "grid.color":           PALETTE["border"],
+    "grid.linestyle":       "--",
+    "grid.alpha":           0.6,
+    "legend.facecolor":     PALETTE["panel"],
+    "legend.edgecolor":     PALETTE["border"],
+    "legend.labelcolor":    PALETTE["text"],
+    "figure.dpi":           130,
+}
+plt.rcParams.update(MPL_STYLE)
 
-# -----------------------------
-# Data loading
-# -----------------------------
-@st.cache_data(show_spinner=False)
-def load_data() -> pd.DataFrame:
-    if not DATA_PATH.exists():
-        st.error(f"Dataset not found at: {DATA_PATH}")
-        st.stop()
+LABEL_STYLE = dict(fontsize=9, fontweight="normal", color=PALETTE["text"])
+TITLE_STYLE = dict(fontsize=11, fontweight="normal", color=PALETTE["text"], pad=10)
 
-    df = pd.read_csv(DATA_PATH, sep=";")
+st.markdown(f"""
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600&display=swap');
 
-    # Normalize whitespace in column names (safe, helps avoid hidden issues)
-    df.columns = [c.strip() for c in df.columns]
+  html, body, [class*="css"] {{
+      font-family: 'IBM Plex Sans', sans-serif;
+      background-color: {PALETTE['bg']};
+      color: {PALETTE['text']};
+  }}
+  .block-container {{ padding: 1.5rem 2rem 3rem 2rem; max-width: 1400px; }}
+  section[data-testid="stSidebar"] {{
+      background-color: {PALETTE['panel']};
+      border-right: 1px solid {PALETTE['border']};
+  }}
+  h1, h2, h3 {{ font-family: 'IBM Plex Mono', monospace; letter-spacing: -0.03em; }}
+  .metric-card {{
+      background: {PALETTE['panel']};
+      border: 1px solid {PALETTE['border']};
+      border-radius: 8px;
+      padding: 1rem 1.25rem;
+      margin-bottom: 0.5rem;
+  }}
+  .metric-value {{
+      font-family: 'IBM Plex Mono', monospace;
+      font-size: 1.6rem;
+      color: {PALETTE['accent1']};
+  }}
+  .metric-label {{
+      font-size: 0.75rem;
+      color: {PALETTE['muted']};
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+  }}
+  .tag {{
+      display: inline-block;
+      background: {PALETTE['border']};
+      color: {PALETTE['accent1']};
+      font-family: 'IBM Plex Mono', monospace;
+      font-size: 0.7rem;
+      padding: 2px 8px;
+      border-radius: 12px;
+      margin: 2px;
+  }}
+  hr {{ border-color: {PALETTE['border']}; }}
+  .stButton > button {{
+      background: {PALETTE['accent1']};
+      color: {PALETTE['bg']};
+      border: none;
+      border-radius: 6px;
+      font-family: 'IBM Plex Mono', monospace;
+      font-size: 0.8rem;
+      font-weight: 600;
+      padding: 0.45rem 1.2rem;
+      transition: opacity 0.15s;
+  }}
+  .stButton > button:hover {{ opacity: 0.85; }}
+</style>
+""", unsafe_allow_html=True)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+def fig_to_st(fig, key=None):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", facecolor=fig.get_facecolor())
+    buf.seek(0)
+    st.image(buf, use_container_width=True)
+    plt.close(fig)
+
+def metric_card(label, value, color=None):
+    c = color or PALETTE["accent1"]
+    st.markdown(f"""
+    <div class="metric-card">
+      <div class="metric-label">{label}</div>
+      <div class="metric-value" style="color:{c}">{value}</div>
+    </div>""", unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA LOADING
+# ─────────────────────────────────────────────────────────────────────────────
+@st.cache_data
+def load_data(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path, sep=";")
+    df["weekend"] = df["weekend"].map({"yes": 1, "no": 0}).astype(int)
     return df
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SIDEBAR
+# ─────────────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("## PharmaQAI")
+    st.markdown("<span class='tag'>Process Intelligence</span> <span class='tag'>ML</span>", unsafe_allow_html=True)
+    st.markdown("---")
 
-def detect_targets(df: pd.DataFrame) -> List[str]:
-    # Prefer known CQAs if present
-    present = [c for c in KNOWN_CQA_TARGETS if c in df.columns]
-
-    # Add keyword-based targets (in case naming differs)
-    keyword_hits: List[str] = []
-    for c in df.columns:
-        cl = c.lower()
-        if any(k in cl for k in ["impur", "release", "solvent", "dissol", "hard", "assay", "uniform"]):
-            if c not in present and c not in ID_COLS:
-                keyword_hits.append(c)
-
-    # Fallback: numeric columns not identifiers
-    numeric = [c for c in df.select_dtypes(include=[np.number]).columns if c not in ID_COLS]
-
-    ordered: List[str] = []
-    for c in present + keyword_hits + numeric:
-        if c not in ordered and c in df.columns:
-            ordered.append(c)
-
-    # Last safety: if still empty, allow any column
-    if not ordered:
-        ordered = [c for c in df.columns if c not in ID_COLS]
-
-    return ordered
-
-
-def feature_types(df: pd.DataFrame, target_col: str) -> Tuple[List[str], List[str]]:
-    X = df.drop(columns=[target_col])
-    cat = [c for c in X.columns if X[c].dtype == "object" or str(X[c].dtype) == "category"]
-    num = [c for c in X.columns if c not in cat]
-    return num, cat
-
-
-def build_preprocessor(num_cols: List[str], cat_cols: List[str], scale_numeric: bool) -> ColumnTransformer:
-    num_steps = [("imputer", SimpleImputer(strategy="median"))]
-    if scale_numeric:
-        num_steps.append(("scaler", StandardScaler()))
-    num_pipe = Pipeline(steps=num_steps)
-
-    cat_pipe = Pipeline(
-        steps=[
-            ("imputer", SimpleImputer(strategy="most_frequent")),
-            ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
-        ]
-    )
-
-    return ColumnTransformer(
-        transformers=[
-            ("num", num_pipe, num_cols),
-            ("cat", cat_pipe, cat_cols),
-        ],
-        remainder="drop",
-        verbose_feature_names_out=False,
-    )
-
-
-def get_feature_names(preprocessor: ColumnTransformer) -> List[str]:
-    try:
-        return list(preprocessor.get_feature_names_out())
-    except Exception:
-        return []
-
-
-# -----------------------------
-# Modeling
-# -----------------------------
-def get_model(problem_mode: str, model_name: str, seed: int):
-    if problem_mode == "regression":
-        if model_name == "Random Forest":
-            return RandomForestRegressor(n_estimators=400, random_state=seed, n_jobs=-1)
-        if model_name == "ElasticNet":
-            return ElasticNet(random_state=seed)
-        raise ValueError("Unknown regression model")
+    uploaded = st.file_uploader("Upload dataset (CSV, semicolon-delimited)", type=["csv"])
+    if uploaded:
+        df_raw = pd.read_csv(uploaded, sep=";")
+        df_raw["weekend"] = df_raw["weekend"].map({"yes": 1, "no": 0}).astype(int)
     else:
-        if model_name == "Random Forest":
-            return RandomForestClassifier(
-                n_estimators=400, random_state=seed, n_jobs=-1, class_weight="balanced"
-            )
-        if model_name == "Logistic Regression":
-            return LogisticRegression(max_iter=5000, class_weight="balanced")
-        raise ValueError("Unknown classification model")
+        df_raw = load_data("Process (1).csv")
 
-
-@st.cache_data(show_spinner=False)
-def prepare_xy(df: pd.DataFrame, target_col: str) -> Tuple[pd.DataFrame, pd.Series]:
-    data = df.dropna(subset=[target_col]).copy()
-    X = data.drop(columns=[target_col])
-    y = data[target_col].copy()
-    return X, y
-
-
-@st.cache_resource(show_spinner=False)
-def train_pipeline(
-    df: pd.DataFrame,
-    target_col: str,
-    problem_mode: str,
-    model_name: str,
-    test_size: float,
-    seed: int,
-    scale_numeric: bool,
-) -> Tuple[Pipeline, pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
-    X, y = prepare_xy(df, target_col)
-
-    stratify = None
-    if problem_mode == "classification" and y.nunique(dropna=True) <= 20:
-        stratify = y
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=seed, stratify=stratify
+    st.markdown("---")
+    page = st.radio(
+        "Navigation",
+        ["Data Overview", "Regression", "Classification", "Contour Explorer"],
+        label_visibility="collapsed"
     )
+    st.markdown("---")
+    muted = PALETTE["muted"]
+    st.markdown(f"<span style='color:{muted};font-size:0.72rem'>1005 batches - 35 features<br>Pharmaceutical tablet manufacturing</span>", unsafe_allow_html=True)
 
-    num_cols, cat_cols = feature_types(pd.concat([X, y], axis=1), target_col)
-    pre = build_preprocessor(num_cols, cat_cols, scale_numeric=scale_numeric)
-    model = get_model(problem_mode, model_name, seed)
+# ─────────────────────────────────────────────────────────────────────────────
+# FEATURE / TARGET DEFINITIONS
+# ─────────────────────────────────────────────────────────────────────────────
+PROCESS_FEATURES = [
+    "tbl_speed_mean", "tbl_speed_change", "tbl_speed_0_duration",
+    "total_waste", "startup_waste", "fom_mean", "fom_change",
+    "SREL_startup_mean", "SREL_production_mean", "SREL_production_max",
+    "main_CompForce mean", "main_CompForce_sd", "main_CompForce_median",
+    "pre_CompForce_mean", "tbl_fill_mean", "tbl_fill_sd",
+    "cyl_height_mean", "stiffness_mean", "stiffness_max", "stiffness_min",
+    "ejection_mean", "ejection_max", "ejection_min",
+    "Startup_tbl_fill_maxDifference", "Startup_main_CompForce_mean",
+    "Startup_tbl_fill_mean", "weekend",
+]
 
-    pipe = Pipeline(steps=[("preprocessor", pre), ("model", model)])
-    pipe.fit(X_train, y_train)
+QUALITY_TARGETS = [
+    "Drug release average (%)", "Drug release min (%)",
+    "Residual solvent", "Total impurities", "Impurity O", "Impurity L",
+]
 
-    return pipe, X_train, X_test, y_train, y_test
+REGRESSION_MODELS = {
+    "Ridge Regression":        Ridge(alpha=1.0),
+    "Lasso Regression":        Lasso(alpha=0.01, max_iter=5000),
+    "Elastic Net":             ElasticNet(alpha=0.01, l1_ratio=0.5, max_iter=5000),
+    "Random Forest":           RandomForestRegressor(n_estimators=200, random_state=42, n_jobs=-1),
+    "Gradient Boosting":       GradientBoostingRegressor(n_estimators=200, random_state=42),
+    "Extra Trees":             ExtraTreesRegressor(n_estimators=200, random_state=42, n_jobs=-1),
+    "SVR (RBF)":               SVR(kernel="rbf", C=10, gamma="scale"),
+    "KNN Regressor":           KNeighborsRegressor(n_neighbors=7),
+    "PLS Regression":          PLSRegression(n_components=5),
+}
+
+CLASSIFICATION_MODELS = {
+    "Logistic Regression":     LogisticRegression(max_iter=1000, random_state=42),
+    "Random Forest":           RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1),
+    "Gradient Boosting":       GradientBoostingClassifier(n_estimators=200, random_state=42),
+    "SVM (RBF)":               SVC(kernel="rbf", probability=True, random_state=42),
+    "KNN Classifier":          KNeighborsClassifier(n_neighbors=7),
+    "LDA":                     LinearDiscriminantAnalysis(),
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PAGE 1 — DATA OVERVIEW
+# ─────────────────────────────────────────────────────────────────────────────
+if page == "Data Overview":
+    st.markdown("# Data Overview")
+    st.markdown(f"<span style='color:{PALETTE['muted']}'>Pharmaceutical tablet manufacturing — process & quality parameters</span>", unsafe_allow_html=True)
+    st.markdown("---")
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1: metric_card("Batches", f"{len(df_raw):,}")
+    with c2: metric_card("Features", str(len(PROCESS_FEATURES)), PALETTE["accent2"])
+    with c3: metric_card("Quality targets", str(len(QUALITY_TARGETS)), PALETTE["accent4"])
+    with c4: metric_card("Product codes", str(df_raw["code"].nunique()), PALETTE["accent3"])
+
+    st.markdown("---")
+    st.markdown("### Sample data")
+    st.dataframe(df_raw.head(20), use_container_width=True, height=280)
+
+    st.markdown("### Descriptive statistics")
+    st.dataframe(df_raw[PROCESS_FEATURES + QUALITY_TARGETS].describe().round(3), use_container_width=True, height=280)
+
+    st.markdown("---")
+    st.markdown("### Quality target distributions")
+
+    fig, axes = plt.subplots(2, 3, figsize=(14, 7))
+    colors = [PALETTE["accent1"], PALETTE["accent2"], PALETTE["accent3"],
+              PALETTE["accent4"], PALETTE["accent5"], "#63e6be"]
+    for ax, col, c in zip(axes.flat, QUALITY_TARGETS, colors):
+        data = df_raw[col].dropna()
+        ax.hist(data, bins=35, color=c, alpha=0.85, edgecolor=PALETTE["bg"], linewidth=0.4)
+        ax.axvline(data.mean(), color="white", linewidth=1.2, linestyle="--", alpha=0.7)
+        ax.set_title(col, **TITLE_STYLE)
+        ax.set_xlabel("Value", **LABEL_STYLE)
+        ax.set_ylabel("Count", **LABEL_STYLE)
+        ax.grid(True, axis="y")
+    plt.tight_layout(pad=1.5)
+    fig_to_st(fig)
+
+    st.markdown("### Correlation heatmap — quality targets")
+    fig, ax = plt.subplots(figsize=(8, 6))
+    corr = df_raw[QUALITY_TARGETS].corr()
+    n = len(QUALITY_TARGETS)
+    im = ax.imshow(corr.values, cmap=CMAP_HEATMAP, vmin=-1, vmax=1)
+    ax.set_xticks(range(n)); ax.set_yticks(range(n))
+    short = [c.replace("Drug release ", "DR ").replace(" (%)", "").replace("Total ", "Tot. ") for c in QUALITY_TARGETS]
+    ax.set_xticklabels(short, rotation=35, ha="right", **LABEL_STYLE)
+    ax.set_yticklabels(short, **LABEL_STYLE)
+    for i in range(n):
+        for j in range(n):
+            ax.text(j, i, f"{corr.values[i,j]:.2f}", ha="center", va="center",
+                    fontsize=8, color="white" if abs(corr.values[i,j]) > 0.5 else PALETTE["muted"])
+    plt.colorbar(im, ax=ax, fraction=0.04, pad=0.04)
+    ax.set_title("Quality Target Correlations", **TITLE_STYLE)
+    plt.tight_layout()
+    fig_to_st(fig)
+
+    st.markdown("### Feature correlation with quality targets (top 10 per target)")
+    sel_qt = st.selectbox("Select quality target", QUALITY_TARGETS)
+    num_feats = [f for f in PROCESS_FEATURES if df_raw[f].dtype != object]
+    corrs = df_raw[num_feats].corrwith(df_raw[sel_qt]).dropna().abs().sort_values(ascending=False).head(10)
+
+    fig, ax = plt.subplots(figsize=(9, 4))
+    bars = ax.barh(corrs.index[::-1], corrs.values[::-1],
+                   color=[PALETTE["accent1"] if v > 0.3 else PALETTE["muted"] for v in corrs.values[::-1]],
+                   edgecolor=PALETTE["bg"], linewidth=0.4)
+    for bar, val in zip(bars, corrs.values[::-1]):
+        ax.text(val + 0.005, bar.get_y() + bar.get_height() / 2,
+                f"{val:.3f}", va="center", fontsize=8, color=PALETTE["text"])
+    ax.set_xlabel("|Pearson r|", **LABEL_STYLE)
+    ax.set_title(f"Top correlations with {sel_qt}", **TITLE_STYLE)
+    ax.set_xlim(0, corrs.max() + 0.1)
+    ax.grid(True, axis="x")
+    plt.tight_layout()
+    fig_to_st(fig)
+
+    st.markdown("### Batch distribution by product code")
+    code_counts = df_raw["code"].value_counts().sort_index()
+    fig, ax = plt.subplots(figsize=(10, 4))
+    cmap_vals = cm.plasma(np.linspace(0.2, 0.9, len(code_counts)))
+    ax.bar(code_counts.index.astype(str), code_counts.values, color=cmap_vals,
+           edgecolor=PALETTE["bg"], linewidth=0.5)
+    ax.set_xlabel("Product code", **LABEL_STYLE)
+    ax.set_ylabel("Number of batches", **LABEL_STYLE)
+    ax.set_title("Batch count per product code", **TITLE_STYLE)
+    ax.grid(True, axis="y")
+    plt.tight_layout()
+    fig_to_st(fig)
 
 
-def regression_metrics(y_true: pd.Series, y_pred: np.ndarray) -> Dict[str, float]:
-    rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
-    return {
-        "R2": float(r2_score(y_true, y_pred)),
-        "MAE": float(mean_absolute_error(y_true, y_pred)),
-        "RMSE": rmse,
+# ─────────────────────────────────────────────────────────────────────────────
+# PAGE 2 — REGRESSION
+# ─────────────────────────────────────────────────────────────────────────────
+elif page == "Regression":
+    st.markdown("# Regression — Quality Prediction")
+    st.markdown(f"<span style='color:{PALETTE['muted']}'>Predict continuous quality attributes from process parameters</span>", unsafe_allow_html=True)
+    st.markdown("---")
+
+    col_s, col_m = st.columns([1, 1])
+    with col_s:
+        target = st.selectbox("Target variable", QUALITY_TARGETS)
+    with col_m:
+        model_name = st.selectbox("Algorithm", list(REGRESSION_MODELS.keys()))
+
+    feat_options = [f for f in PROCESS_FEATURES if df_raw[f].dtype != object]
+    sel_feats = st.multiselect("Input features", feat_options, default=feat_options[:12])
+
+    c1, c2, c3 = st.columns(3)
+    test_size  = c1.slider("Test set size", 0.10, 0.40, 0.20, 0.05)
+    cv_folds   = c2.slider("CV folds", 3, 10, 5)
+    run_btn    = c3.button("Run regression", use_container_width=True)
+
+    if run_btn:
+        if len(sel_feats) < 2:
+            st.warning("Select at least 2 features.")
+            st.stop()
+
+        df_model = df_raw[sel_feats + [target]].dropna()
+        X = df_model[sel_feats].values
+        y = df_model[target].values
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=test_size, random_state=42)
+
+        model = REGRESSION_MODELS[model_name]
+        if isinstance(model, PLSRegression):
+            model.set_params(n_components=min(5, len(sel_feats)))
+
+        pipe = Pipeline([("scaler", StandardScaler()), ("model", model)])
+        pipe.fit(X_train, y_train)
+        y_pred = pipe.predict(X_test)
+        if y_pred.ndim > 1:
+            y_pred = y_pred.ravel()
+
+        r2   = r2_score(y_test, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+        mae  = mean_absolute_error(y_test, y_pred)
+        cv_r2 = cross_val_score(pipe, X, y, cv=cv_folds, scoring="r2").mean()
+
+        st.markdown("---")
+        m1, m2, m3, m4 = st.columns(4)
+        with m1: metric_card("R²", f"{r2:.4f}", PALETTE["accent2"] if r2 > 0.7 else PALETTE["accent3"])
+        with m2: metric_card("RMSE", f"{rmse:.4f}", PALETTE["accent1"])
+        with m3: metric_card("MAE",  f"{mae:.4f}",  PALETTE["accent4"])
+        with m4: metric_card(f"CV R² ({cv_folds}-fold)", f"{cv_r2:.4f}", PALETTE["accent5"])
+
+        st.markdown("---")
+        st.markdown("### Predicted vs Actual")
+
+        residuals = y_test - y_pred
+        fig = plt.figure(figsize=(14, 5))
+        gs  = GridSpec(1, 3, figure=fig, wspace=0.35)
+
+        # Scatter predicted vs actual
+        ax1 = fig.add_subplot(gs[0])
+        sc = ax1.scatter(y_test, y_pred, c=residuals, cmap=CMAP_SCATTER,
+                         s=30, alpha=0.75, edgecolors="none")
+        lo, hi = min(y_test.min(), y_pred.min()), max(y_test.max(), y_pred.max())
+        ax1.plot([lo, hi], [lo, hi], color=PALETTE["accent2"], linewidth=1.5, linestyle="--", label="Perfect fit")
+        plt.colorbar(sc, ax=ax1, fraction=0.04, pad=0.04, label="Residual")
+        ax1.set_xlabel("Actual", **LABEL_STYLE)
+        ax1.set_ylabel("Predicted", **LABEL_STYLE)
+        ax1.set_title(f"{model_name}\nPredicted vs Actual", **TITLE_STYLE)
+        ax1.legend(fontsize=8)
+        ax1.grid(True)
+
+        # Residual distribution
+        ax2 = fig.add_subplot(gs[1])
+        ax2.hist(residuals, bins=30, color=PALETTE["accent1"], edgecolor=PALETTE["bg"],
+                 linewidth=0.4, alpha=0.9)
+        ax2.axvline(0, color=PALETTE["accent3"], linewidth=1.5, linestyle="--")
+        ax2.set_xlabel("Residual", **LABEL_STYLE)
+        ax2.set_ylabel("Count", **LABEL_STYLE)
+        ax2.set_title("Residual Distribution", **TITLE_STYLE)
+        ax2.grid(True, axis="y")
+
+        # Residuals vs predicted
+        ax3 = fig.add_subplot(gs[2])
+        ax3.scatter(y_pred, residuals, c=PALETTE["accent4"], s=28, alpha=0.7, edgecolors="none")
+        ax3.axhline(0, color=PALETTE["accent3"], linewidth=1.5, linestyle="--")
+        ax3.set_xlabel("Predicted", **LABEL_STYLE)
+        ax3.set_ylabel("Residual", **LABEL_STYLE)
+        ax3.set_title("Residuals vs Fitted", **TITLE_STYLE)
+        ax3.grid(True)
+
+        fig_to_st(fig)
+
+        # Feature importance (if available)
+        has_fi = hasattr(pipe.named_steps["model"], "feature_importances_")
+        has_coef = hasattr(pipe.named_steps["model"], "coef_")
+        if has_fi or has_coef:
+            st.markdown("### Feature importance")
+            if has_fi:
+                importances = pipe.named_steps["model"].feature_importances_
+            else:
+                coef = pipe.named_steps["model"].coef_
+                if coef.ndim > 1:
+                    coef = coef[0]
+                importances = np.abs(coef)
+
+            idx = np.argsort(importances)[::-1][:15]
+            fig, ax = plt.subplots(figsize=(10, 4))
+            bar_c = cm.plasma(np.linspace(0.2, 0.85, len(idx)))
+            ax.bar(range(len(idx)), importances[idx], color=bar_c, edgecolor=PALETTE["bg"], linewidth=0.4)
+            ax.set_xticks(range(len(idx)))
+            ax.set_xticklabels([sel_feats[i] for i in idx], rotation=40, ha="right", fontsize=8, color=PALETTE["text"])
+            ax.set_ylabel("Importance", **LABEL_STYLE)
+            ax.set_title(f"Top feature importances — {model_name}", **TITLE_STYLE)
+            ax.grid(True, axis="y")
+            plt.tight_layout()
+            fig_to_st(fig)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PAGE 3 — CLASSIFICATION
+# ─────────────────────────────────────────────────────────────────────────────
+elif page == "Classification":
+    st.markdown("# Classification — Batch Categorisation")
+    st.markdown(f"<span style='color:{PALETTE['muted']}'>Predict batch categories from process parameters</span>", unsafe_allow_html=True)
+    st.markdown("---")
+
+    clf_targets = {
+        "Weekend batch (yes/no)": "weekend",
+        "Product code (multi-class)": "code",
     }
+    c1, c2 = st.columns(2)
+    clf_target_label = c1.selectbox("Classification target", list(clf_targets.keys()))
+    clf_model_name   = c2.selectbox("Algorithm", list(CLASSIFICATION_MODELS.keys()))
 
+    feat_options = [f for f in PROCESS_FEATURES if df_raw[f].dtype != object and f != clf_targets[clf_target_label]]
+    sel_feats = st.multiselect("Input features", feat_options, default=feat_options[:12])
 
-def classification_metrics(y_true: pd.Series, y_pred: np.ndarray, y_proba: Optional[np.ndarray]) -> Dict[str, float]:
-    out = {"Accuracy": float(accuracy_score(y_true, y_pred))}
-    if y_proba is not None and y_true.nunique() == 2:
-        out["ROC AUC"] = float(roc_auc_score(y_true, y_proba))
-    return out
+    c3, c4, c5 = st.columns(3)
+    test_size = c3.slider("Test set size", 0.10, 0.40, 0.20, 0.05)
+    cv_folds  = c4.slider("CV folds", 3, 10, 5)
+    run_btn   = c5.button("Run classification", use_container_width=True)
 
+    if run_btn:
+        if len(sel_feats) < 2:
+            st.warning("Select at least 2 features.")
+            st.stop()
 
-# -----------------------------
-# Plot helpers
-# -----------------------------
-def plot_correlation_heatmap(df: pd.DataFrame):
-    num = df.select_dtypes(include=[np.number]).copy()
-    if num.shape[1] < 2:
-        st.info("Not enough numeric columns for correlation heatmap.")
-        return
-    corr = num.corr(numeric_only=True)
-    fig = px.imshow(corr, aspect="auto", title="Correlation heatmap (numeric columns)")
-    st.plotly_chart(fig, width="stretch")
+        clf_col = clf_targets[clf_target_label]
+        df_model = df_raw[sel_feats + [clf_col]].dropna()
+        X = df_model[sel_feats].values
+        y = df_model[clf_col].values
+        classes = np.unique(y)
+        is_binary = len(classes) == 2
 
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=test_size, random_state=42, stratify=y)
 
-def plot_feature_importance(pipe: Pipeline, X_test: pd.DataFrame, y_test: pd.Series, problem_mode: str):
-    pre = pipe.named_steps["preprocessor"]
-    names = get_feature_names(pre)
-    if not names:
-        st.info("Could not extract feature names for importance.")
-        return
-
-    scoring = "r2" if problem_mode == "regression" else ("roc_auc" if y_test.nunique() == 2 else "accuracy")
-
-    try:
-        r = permutation_importance(
-            pipe, X_test, y_test, n_repeats=12, random_state=0, n_jobs=-1, scoring=scoring
-        )
-    except Exception as e:
-        st.warning(f"Permutation importance failed: {e}")
-        return
-
-    imp = (
-        pd.DataFrame(
-            {"feature": names, "importance_mean": r.importances_mean, "importance_std": r.importances_std}
-        )
-        .sort_values("importance_mean", ascending=False)
-        .head(25)
-    )
-
-    fig = px.bar(
-        imp.iloc[::-1],
-        x="importance_mean",
-        y="feature",
-        orientation="h",
-        error_x="importance_std",
-        title="Permutation importance (top 25)",
-    )
-    st.plotly_chart(fig, width="stretch")
-
-
-def plot_predictions(pipe: Pipeline, X_test: pd.DataFrame, y_test: pd.Series, problem_mode: str):
-    if problem_mode == "regression":
+        model = CLASSIFICATION_MODELS[clf_model_name]
+        pipe  = Pipeline([("scaler", StandardScaler()), ("model", model)])
+        pipe.fit(X_train, y_train)
         y_pred = pipe.predict(X_test)
-        met = regression_metrics(y_test, y_pred)
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("R2", f"{met['R2']:.4f}")
-        c2.metric("MAE", f"{met['MAE']:.4f}")
-        c3.metric("RMSE", f"{met['RMSE']:.4f}")
+        acc  = accuracy_score(y_test, y_pred)
+        cv_acc = cross_val_score(pipe, X, y, cv=cv_folds, scoring="accuracy").mean()
 
-        dfp = pd.DataFrame({"Actual": y_test.values, "Predicted": y_pred})
-        fig1 = px.scatter(dfp, x="Actual", y="Predicted", title="Actual vs Predicted")
-        st.plotly_chart(fig1, width="stretch")
-
-        resid = y_test.values - y_pred
-        fig2 = px.scatter(
-            x=y_pred,
-            y=resid,
-            labels={"x": "Predicted", "y": "Residual"},
-            title="Residuals vs Predicted",
-        )
-        st.plotly_chart(fig2, width="stretch")
-
-    else:
-        y_pred = pipe.predict(X_test)
-        y_proba = None
-        if hasattr(pipe, "predict_proba") and y_test.nunique() == 2:
-            y_proba = pipe.predict_proba(X_test)[:, 1]
-
-        met = classification_metrics(y_test, y_pred, y_proba)
-        cols = st.columns(len(met))
-        for i, (k, v) in enumerate(met.items()):
-            cols[i].metric(k, f"{v:.4f}")
-
-        st.text("Classification report")
-        st.text(classification_report(y_test, y_pred))
-
-        cm = confusion_matrix(y_test, y_pred)
-        fig = px.imshow(cm, text_auto=True, title="Confusion matrix")
-        st.plotly_chart(fig, width="stretch")
-
-        if y_proba is not None:
-            fig2 = px.histogram(
-                pd.DataFrame({"p(out_of_spec)": y_proba}),
-                x="p(out_of_spec)",
-                nbins=30,
-                title="Predicted probability distribution",
-            )
-            st.plotly_chart(fig2, width="stretch")
-
-
-def contour_explorer(pipe: Pipeline, df: pd.DataFrame, target_col: str, problem_mode: str):
-    data = df.dropna(subset=[target_col]).copy()
-    X = data.drop(columns=[target_col])
-    y = data[target_col]
-
-    num_cols = list(X.select_dtypes(include=[np.number]).columns)
-    if len(num_cols) < 2:
-        st.info("Need at least two numeric input features for contour plots.")
-        return
-
-    c1, c2, c3 = st.columns([1, 1, 1])
-    with c1:
-        x_feat = st.selectbox("X feature", options=num_cols, index=0)
-    with c2:
-        y_feat = st.selectbox("Y feature", options=[c for c in num_cols if c != x_feat], index=0)
-    with c3:
-        grid_n = st.slider("Grid resolution", min_value=25, max_value=120, value=60, step=5)
-
-    # Hold other features at median (numeric) / mode (categorical)
-    fixed: Dict[str, object] = {}
-    for col in X.columns:
-        if col in (x_feat, y_feat):
-            continue
-        if X[col].dtype == "object" or str(X[col].dtype) == "category":
-            fixed[col] = X[col].dropna().mode().iloc[0] if X[col].dropna().shape[0] else "unknown"
+        if is_binary and hasattr(pipe, "predict_proba"):
+            y_prob = pipe.predict_proba(X_test)[:, 1]
+            auc = roc_auc_score(y_test, y_prob)
         else:
-            fixed[col] = float(pd.to_numeric(X[col], errors="coerce").median())
+            auc = None
 
-    # grid ranges based on 1st and 99th percentiles
-    x_vals = pd.to_numeric(X[x_feat], errors="coerce").dropna().values
-    y_vals = pd.to_numeric(X[y_feat], errors="coerce").dropna().values
-    x_min, x_max = np.nanpercentile(x_vals, [1, 99])
-    y_min, y_max = np.nanpercentile(y_vals, [1, 99])
+        st.markdown("---")
+        m1, m2, m3, m4 = st.columns(4)
+        with m1: metric_card("Accuracy", f"{acc:.4f}", PALETTE["accent2"] if acc > 0.8 else PALETTE["accent3"])
+        with m2: metric_card(f"CV Acc ({cv_folds}-fold)", f"{cv_acc:.4f}", PALETTE["accent1"])
+        with m3: metric_card("Classes", str(len(classes)), PALETTE["accent4"])
+        with m4: metric_card("AUC-ROC", f"{auc:.4f}" if auc else "N/A", PALETTE["accent5"])
 
-    gx = np.linspace(x_min, x_max, grid_n)
-    gy = np.linspace(y_min, y_max, grid_n)
-    XX, YY = np.meshgrid(gx, gy)
+        st.markdown("---")
+        fig = plt.figure(figsize=(14, 5 if not is_binary else 5))
+        gs  = GridSpec(1, 3 if is_binary else 2, figure=fig, wspace=0.38)
 
-    grid = pd.DataFrame({x_feat: XX.ravel(), y_feat: YY.ravel()})
-    for col, val in fixed.items():
-        grid[col] = val
+        # Confusion matrix
+        ax1 = fig.add_subplot(gs[0])
+        cm_mat = confusion_matrix(y_test, y_pred, labels=classes)
+        cm_norm = cm_mat.astype(float) / cm_mat.sum(axis=1, keepdims=True)
+        im = ax1.imshow(cm_norm, cmap="Blues", vmin=0, vmax=1)
+        ax1.set_xticks(range(len(classes))); ax1.set_yticks(range(len(classes)))
+        clabels = [str(c) for c in classes]
+        ax1.set_xticklabels(clabels, rotation=45, ha="right", fontsize=8, color=PALETTE["text"])
+        ax1.set_yticklabels(clabels, fontsize=8, color=PALETTE["text"])
+        for i in range(len(classes)):
+            for j in range(len(classes)):
+                ax1.text(j, i, f"{cm_mat[i,j]}", ha="center", va="center",
+                         fontsize=8, color="white" if cm_norm[i,j] > 0.5 else PALETTE["muted"])
+        plt.colorbar(im, ax=ax1, fraction=0.04, pad=0.04)
+        ax1.set_xlabel("Predicted", **LABEL_STYLE)
+        ax1.set_ylabel("Actual", **LABEL_STYLE)
+        ax1.set_title("Confusion Matrix (normalised)", **TITLE_STYLE)
 
-    if problem_mode == "regression":
-        Z = pipe.predict(grid).reshape(YY.shape)
-        z_title = f"Predicted {target_col}"
-    else:
-        if hasattr(pipe, "predict_proba") and y.nunique() == 2:
-            Z = pipe.predict_proba(grid)[:, 1].reshape(YY.shape)
-            z_title = "Predicted p(out_of_spec)"
-        else:
-            Z = pipe.predict(grid).reshape(YY.shape)
-            z_title = "Predicted class"
+        # Per-class accuracy bar
+        ax2 = fig.add_subplot(gs[1])
+        per_class_acc = cm_norm.diagonal()
+        bar_c = cm.viridis(np.linspace(0.3, 0.9, len(classes)))
+        ax2.bar(clabels, per_class_acc, color=bar_c, edgecolor=PALETTE["bg"], linewidth=0.4)
+        ax2.set_ylim(0, 1.05)
+        ax2.axhline(acc, color=PALETTE["accent3"], linestyle="--", linewidth=1.2, label=f"Overall acc={acc:.3f}")
+        ax2.set_xlabel("Class", **LABEL_STYLE)
+        ax2.set_ylabel("Recall", **LABEL_STYLE)
+        ax2.set_title("Per-class recall", **TITLE_STYLE)
+        ax2.legend(fontsize=8)
+        ax2.grid(True, axis="y")
 
-    fig = go.Figure()
-    fig.add_trace(go.Contour(x=gx, y=gy, z=Z, contours_coloring="heatmap", colorbar_title=z_title))
+        # ROC curve for binary
+        if is_binary:
+            ax3 = fig.add_subplot(gs[2])
+            fpr, tpr, _ = roc_curve(y_test, y_prob)
+            ax3.plot(fpr, tpr, color=PALETTE["accent1"], linewidth=2.0, label=f"AUC = {auc:.3f}")
+            ax3.plot([0, 1], [0, 1], color=PALETTE["muted"], linestyle="--", linewidth=1)
+            ax3.fill_between(fpr, tpr, alpha=0.15, color=PALETTE["accent1"])
+            ax3.set_xlabel("False positive rate", **LABEL_STYLE)
+            ax3.set_ylabel("True positive rate", **LABEL_STYLE)
+            ax3.set_title("ROC Curve", **TITLE_STYLE)
+            ax3.legend(fontsize=9)
+            ax3.grid(True)
 
-    # Overlay observed points (sample)
-    sample_n = min(600, len(X))
-    rng = np.random.default_rng(0)
-    idx = rng.choice(len(X), size=sample_n, replace=False)
-    fig.add_trace(
-        go.Scatter(
-            x=pd.to_numeric(X.iloc[idx][x_feat], errors="coerce"),
-            y=pd.to_numeric(X.iloc[idx][y_feat], errors="coerce"),
-            mode="markers",
-            marker=dict(size=5),
-            name="Observed batches",
-        )
-    )
+        fig_to_st(fig)
 
-    fig.update_layout(
-        title=f"Contour explorer: {x_feat} vs {y_feat}",
-        xaxis_title=x_feat,
-        yaxis_title=y_feat,
-        height=650,
-    )
-    st.plotly_chart(fig, width="stretch")
-    st.caption("Other features held at median (numeric) or mode (categorical).")
-
-
-# -----------------------------
-# Single prediction
-# -----------------------------
-def single_input_form(df: pd.DataFrame, target_col: str) -> pd.DataFrame:
-    X = df.drop(columns=[target_col])
-    row: Dict[str, object] = {}
-
-    st.write("Adjust process/material parameters and get an instant model prediction.")
-
-    for col in X.columns:
-        if X[col].dtype == "object" or str(X[col].dtype) == "category":
-            opts = list(pd.Series(X[col]).dropna().unique())
-            row[col] = st.selectbox(col, options=opts if opts else ["unknown"], index=0)
-        else:
-            s = pd.to_numeric(X[col], errors="coerce")
-            p1 = float(np.nanpercentile(s, 1))
-            p99 = float(np.nanpercentile(s, 99))
-            med = float(np.nanmedian(s))
-            if np.isfinite(p1) and np.isfinite(p99) and p1 != p99:
-                row[col] = st.slider(col, min_value=p1, max_value=p99, value=med)
+        # Feature importance
+        has_fi   = hasattr(pipe.named_steps["model"], "feature_importances_")
+        has_coef = hasattr(pipe.named_steps["model"], "coef_")
+        if has_fi or has_coef:
+            st.markdown("### Feature importance")
+            if has_fi:
+                importances = pipe.named_steps["model"].feature_importances_
             else:
-                row[col] = st.number_input(col, value=med)
-
-    return pd.DataFrame([row])
-
-
-# -----------------------------
-# Main
-# -----------------------------
-def main():
-    st.title("PharmaQualityAI: tablet quality prediction from manufacturing data")
-
-    df = load_data()
-
-    targets = detect_targets(df)
-    cqa_present = [c for c in KNOWN_CQA_TARGETS if c in df.columns]
-
-    with st.sidebar:
-        st.header("Dataset")
-        st.write(f"Loaded: {DATA_FILENAME}")
-        st.write(f"Rows: {df.shape[0]}  Columns: {df.shape[1]}")
-
-        st.header("Targets")
-        if cqa_present:
-            st.write("CQA targets detected:")
-            st.write(cqa_present)
-        else:
-            st.write("No standard CQA names detected. Using numeric columns as candidates.")
-
-        default_target = "Drug release average (%)" if "Drug release average (%)" in targets else targets[0]
-        target = st.selectbox("Select target", options=targets, index=targets.index(default_target))
-
-        st.header("Objective")
-        objective = st.radio("Mode", options=["Regression", "Classification (out-of-spec)"])
-        problem_mode = "regression" if objective == "Regression" else "classification"
-
-        # Classification spec limits
-        lower_spec = np.nan
-        upper_spec = np.nan
-        if problem_mode == "classification":
-            st.subheader("Spec limits")
-            st.write("Label: 1 = out-of-spec, 0 = within spec")
-            colA, colB = st.columns(2)
-            with colA:
-                lower_spec = st.number_input("Lower spec (optional)", value=float("nan"))
-            with colB:
-                upper_spec = st.number_input("Upper spec (optional)", value=float("nan"))
-
-        st.header("Model")
-        if problem_mode == "regression":
-            model_name = st.selectbox("Algorithm", options=["Random Forest", "ElasticNet"], index=0)
-        else:
-            model_name = st.selectbox("Algorithm", options=["Random Forest", "Logistic Regression"], index=0)
-
-        test_size = st.slider("Test size", 0.1, 0.4, 0.2, 0.05)
-        seed = st.number_input("Random seed", value=42, step=1)
-
-        scale_numeric = st.checkbox(
-            "Scale numeric features",
-            value=(model_name in {"ElasticNet", "Logistic Regression"}),
-        )
-
-    # Build working dataframe (classification adds a label column)
-    work_df = df.copy()
-
-    if problem_mode == "classification":
-        y_num = pd.to_numeric(work_df[target], errors="coerce")
-
-        # If no limits provided, auto-define abnormal batches using robust threshold
-        no_limits = (not np.isfinite(lower_spec)) and (not np.isfinite(upper_spec))
-
-        if no_limits:
-            med = float(np.nanmedian(y_num))
-            mad = float(np.nanmedian(np.abs(y_num - med)))
-            thr = 3.0 * mad if mad > 0 else float(np.nanstd(y_num))
-            if not np.isfinite(thr) or thr == 0:
-                thr = float(np.nanstd(y_num)) if np.isfinite(np.nanstd(y_num)) else 1.0
-            label = (np.abs(y_num - med) > thr).astype(int)
-        else:
-            label = pd.Series(0, index=work_df.index, dtype="int64")
-            if np.isfinite(lower_spec):
-                label = label | (y_num < lower_spec).astype(int)
-            if np.isfinite(upper_spec):
-                label = label | (y_num > upper_spec).astype(int)
-
-        work_df["__out_of_spec__"] = label
-        target_col = "__out_of_spec__"
-    else:
-        target_col = target
-
-    tabs = st.tabs(["Data overview", "Model performance", "Single prediction", "Contour explorer"])
-
-    with tabs[0]:
-        st.subheader("Preview")
-        st.dataframe(df.head(20), width="stretch")
-
-        st.subheader("Missing values")
-        mv = df.isna().sum().sort_values(ascending=False)
-        mv = mv[mv > 0]
-        if len(mv) == 0:
-            st.write("No missing values detected.")
-        else:
-            st.dataframe(mv.to_frame("missing_count"), width="stretch")
-
-        st.subheader("Distribution")
-        num_cols = list(df.select_dtypes(include=[np.number]).columns)
-        if num_cols:
-            col = st.selectbox("Column", options=num_cols, index=num_cols.index(target) if target in num_cols else 0)
-            fig = px.histogram(df, x=col, nbins=40, title=f"Distribution: {col}")
-            st.plotly_chart(fig, width="stretch")
-
-        st.subheader("Correlations")
-        plot_correlation_heatmap(df)
-
-    # Train pipeline
-    pipe, X_train, X_test, y_train, y_test = train_pipeline(
-        df=work_df,
-        target_col=target_col,
-        problem_mode=problem_mode,
-        model_name=model_name,
-        test_size=float(test_size),
-        seed=int(seed),
-        scale_numeric=scale_numeric,
-    )
-
-    with tabs[1]:
-        st.subheader("Hold-out performance")
-        plot_predictions(pipe, X_test, y_test, problem_mode)
-
-        st.subheader("What drives predictions")
-        plot_feature_importance(pipe, X_test, y_test, problem_mode)
-
-    with tabs[2]:
-        st.subheader("What-if prediction")
-        if problem_mode == "regression":
-            st.write(f"Target: {target}")
-            input_df = single_input_form(work_df, target_col)
-            pred = float(pipe.predict(input_df)[0])
-            st.metric("Predicted value", f"{pred:.4f}")
-        else:
-            st.write(f"Risk label derived from: {target}")
-            input_df = single_input_form(work_df, target_col)
-            if hasattr(pipe, "predict_proba") and y_test.nunique() == 2:
-                p = float(pipe.predict_proba(input_df)[0, 1])
-                st.metric("Predicted p(out_of_spec)", f"{p:.4f}")
-                st.metric("Predicted label (threshold 0.5)", str(int(p >= 0.5)))
-            else:
-                cls = int(pipe.predict(input_df)[0])
-                st.metric("Predicted label", str(cls))
-
-    with tabs[3]:
-        st.subheader("Contour explorer")
-        contour_explorer(pipe, work_df, target_col, problem_mode)
+                coef = pipe.named_steps["model"].coef_
+                if coef.ndim > 1:
+                    coef = np.abs(coef).mean(axis=0)
+                importances = np.abs(coef)
+            idx = np.argsort(importances)[::-1][:15]
+            fig, ax = plt.subplots(figsize=(10, 4))
+            bar_c = cm.plasma(np.linspace(0.15, 0.85, len(idx)))
+            ax.bar(range(len(idx)), importances[idx], color=bar_c, edgecolor=PALETTE["bg"], linewidth=0.4)
+            ax.set_xticks(range(len(idx)))
+            ax.set_xticklabels([sel_feats[i] for i in idx], rotation=40, ha="right", fontsize=8, color=PALETTE["text"])
+            ax.set_ylabel("Importance", **LABEL_STYLE)
+            ax.set_title(f"Top feature importances — {clf_model_name}", **TITLE_STYLE)
+            ax.grid(True, axis="y")
+            plt.tight_layout()
+            fig_to_st(fig)
 
 
-if __name__ == "__main__":
-    main()
+# ─────────────────────────────────────────────────────────────────────────────
+# PAGE 4 — CONTOUR EXPLORER
+# ─────────────────────────────────────────────────────────────────────────────
+elif page == "Contour Explorer":
+    st.markdown("# Contour Explorer")
+    st.markdown(f"<span style='color:{PALETTE['muted']}'>Visualise how two process parameters jointly influence a quality attribute using a trained ML model</span>", unsafe_allow_html=True)
+    st.markdown("---")
+
+    feat_options = [f for f in PROCESS_FEATURES if df_raw[f].dtype != object]
+
+    c1, c2, c3 = st.columns(3)
+    x_feat  = c1.selectbox("X-axis feature",   feat_options, index=0)
+    y_feat  = c2.selectbox("Y-axis feature",    feat_options, index=3)
+    c_target = c3.selectbox("Response (target)", QUALITY_TARGETS, index=0)
+
+    c4, c5, c6 = st.columns(3)
+    model_name = c4.selectbox("Model", list(REGRESSION_MODELS.keys()), index=3)
+    grid_res   = c5.slider("Grid resolution", 30, 120, 60, 10)
+    run_contour = c6.button("Generate contour", use_container_width=True)
+
+    if run_contour:
+        if x_feat == y_feat:
+            st.warning("X and Y features must be different.")
+            st.stop()
+
+        remaining_feats = [f for f in feat_options if f not in (x_feat, y_feat)]
+        df_model = df_raw[feat_options + [c_target]].dropna()
+        X_all = df_model[feat_options].values
+        y_all = df_model[c_target].values
+
+        model = REGRESSION_MODELS[model_name]
+        if isinstance(model, PLSRegression):
+            model.set_params(n_components=min(5, len(feat_options)))
+
+        pipe = Pipeline([("scaler", StandardScaler()), ("model", model)])
+        pipe.fit(X_all, y_all)
+        y_pred_train = pipe.predict(X_all)
+        if y_pred_train.ndim > 1:
+            y_pred_train = y_pred_train.ravel()
+        train_r2 = r2_score(y_all, y_pred_train)
+
+        xi = feat_options.index(x_feat)
+        yi = feat_options.index(y_feat)
+        means = df_model[feat_options].mean().values
+
+        x_range = np.linspace(df_model[x_feat].quantile(0.02), df_model[x_feat].quantile(0.98), grid_res)
+        y_range = np.linspace(df_model[y_feat].quantile(0.02), df_model[y_feat].quantile(0.98), grid_res)
+        XX, YY  = np.meshgrid(x_range, y_range)
+
+        grid_input = np.tile(means, (grid_res * grid_res, 1))
+        grid_input[:, xi] = XX.ravel()
+        grid_input[:, yi] = YY.ravel()
+        ZZ = pipe.predict(grid_input)
+        if ZZ.ndim > 1:
+            ZZ = ZZ.ravel()
+        ZZ = ZZ.reshape(grid_res, grid_res)
+
+        st.markdown(f"<span style='color:{PALETTE['muted']}'>Model R² on training data: <b style='color:{PALETTE['accent2']}'>{train_r2:.4f}</b> — all other features held at their dataset mean</span>", unsafe_allow_html=True)
+        st.markdown("---")
+
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+        # Filled contour
+        ax = axes[0]
+        cf = ax.contourf(XX, YY, ZZ, levels=25, cmap=CMAP_CONTOUR, alpha=0.95)
+        plt.colorbar(cf, ax=ax, fraction=0.046, pad=0.04, label=c_target)
+        sc = ax.scatter(df_model[x_feat], df_model[y_feat],
+                        c=df_model[c_target], cmap=CMAP_CONTOUR, s=15,
+                        edgecolors=PALETTE["bg"], linewidth=0.3, alpha=0.85, zorder=5)
+        ax.set_xlabel(x_feat, **LABEL_STYLE)
+        ax.set_ylabel(y_feat, **LABEL_STYLE)
+        ax.set_title(f"Filled contour\n{c_target}", **TITLE_STYLE)
+        ax.grid(True, alpha=0.3)
+
+        # Line contour with labels
+        ax = axes[1]
+        cs = ax.contour(XX, YY, ZZ, levels=15, cmap="coolwarm", linewidths=1.2)
+        ax.clabel(cs, inline=True, fontsize=7, fmt="%.2f", colors=[PALETTE["text"]])
+        ax.contourf(XX, YY, ZZ, levels=25, cmap=CMAP_CONTOUR, alpha=0.25)
+        ax.set_xlabel(x_feat, **LABEL_STYLE)
+        ax.set_ylabel(y_feat, **LABEL_STYLE)
+        ax.set_title(f"Labelled contour\n{c_target}", **TITLE_STYLE)
+        ax.grid(True, alpha=0.3)
+
+        # 3D surface
+        ax3d = fig.add_subplot(1, 3, 3, projection="3d")
+        surf = ax3d.plot_surface(XX, YY, ZZ, cmap=CMAP_CONTOUR, edgecolor="none", alpha=0.9, rstride=2, cstride=2)
+        ax3d.set_xlabel(x_feat, fontsize=7, color=PALETTE["text"], labelpad=4)
+        ax3d.set_ylabel(y_feat, fontsize=7, color=PALETTE["text"], labelpad=4)
+        ax3d.set_zlabel(c_target, fontsize=7, color=PALETTE["text"], labelpad=4)
+        ax3d.set_title(f"3D response surface\n{c_target}", fontsize=10, color=PALETTE["text"], pad=6)
+        ax3d.tick_params(labelsize=6, colors=PALETTE["muted"])
+        ax3d.set_facecolor(PALETTE["panel"])
+        fig.colorbar(surf, ax=ax3d, fraction=0.03, pad=0.04, shrink=0.5, label=c_target)
+
+        plt.tight_layout(pad=1.5)
+        fig_to_st(fig)
+
+        # Marginal plots
+        st.markdown("### Marginal effect plots")
+        fig2, (ax_x, ax_y) = plt.subplots(1, 2, figsize=(12, 4))
+
+        x_line = np.linspace(x_range[0], x_range[-1], 200)
+        inp_x  = np.tile(means, (200, 1))
+        inp_x[:, xi] = x_line
+        z_x = pipe.predict(inp_x)
+        if z_x.ndim > 1: z_x = z_x.ravel()
+        ax_x.plot(x_line, z_x, color=PALETTE["accent1"], linewidth=2)
+        ax_x.fill_between(x_line, z_x, alpha=0.15, color=PALETTE["accent1"])
+        ax_x.set_xlabel(x_feat, **LABEL_STYLE)
+        ax_x.set_ylabel(c_target, **LABEL_STYLE)
+        ax_x.set_title(f"Marginal effect of {x_feat}", **TITLE_STYLE)
+        ax_x.grid(True)
+
+        y_line = np.linspace(y_range[0], y_range[-1], 200)
+        inp_y  = np.tile(means, (200, 1))
+        inp_y[:, yi] = y_line
+        z_y = pipe.predict(inp_y)
+        if z_y.ndim > 1: z_y = z_y.ravel()
+        ax_y.plot(y_line, z_y, color=PALETTE["accent2"], linewidth=2)
+        ax_y.fill_between(y_line, z_y, alpha=0.15, color=PALETTE["accent2"])
+        ax_y.set_xlabel(y_feat, **LABEL_STYLE)
+        ax_y.set_ylabel(c_target, **LABEL_STYLE)
+        ax_y.set_title(f"Marginal effect of {y_feat}", **TITLE_STYLE)
+        ax_y.grid(True)
+
+        plt.tight_layout()
+        fig_to_st(fig2)
