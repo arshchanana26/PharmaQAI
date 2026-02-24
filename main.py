@@ -1,4 +1,11 @@
+# main.py
+# Streamlit app: ML-based prediction of tablet quality attributes from manufacturing data
+# Loads CSV from repository (no upload required), trains models, interactive plots + contour exploration.
+
+from __future__ import annotations
+
 from pathlib import Path
+from typing import List, Tuple, Optional, Dict
 
 import numpy as np
 import pandas as pd
@@ -10,8 +17,13 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
-    r2_score, mean_absolute_error, mean_squared_error,
-    accuracy_score, roc_auc_score, classification_report, confusion_matrix
+    r2_score,
+    mean_absolute_error,
+    mean_squared_error,
+    accuracy_score,
+    roc_auc_score,
+    classification_report,
+    confusion_matrix,
 )
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from sklearn.linear_model import ElasticNet, LogisticRegression
@@ -21,12 +33,15 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 
-st.set_page_config(page_title="Tablet Quality Prediction", layout="wide")
+# -----------------------------
+# App config
+# -----------------------------
+st.set_page_config(page_title="PharmaQualityAI", layout="wide")
 
-# Load from repo folder reliably (works on Streamlit Cloud)
-DATA_PATH = Path(__file__).resolve().parent / "Process (1).csv"
+DATA_FILENAME = "Process (1).csv"  # keep exactly as committed in repo
+DATA_PATH = Path(__file__).resolve().parent / DATA_FILENAME
 
-KNOWN_TARGETS = [
+KNOWN_CQA_TARGETS = [
     "Drug release average (%)",
     "Drug release min (%)",
     "Residual solvent",
@@ -34,108 +49,169 @@ KNOWN_TARGETS = [
     "Impurity O",
     "Impurity L",
 ]
-ID_COLS = ["batch", "code"]
+
+ID_COLS = {"batch", "code"}  # identifier columns (never used as targets)
 
 
+# -----------------------------
+# Data loading
+# -----------------------------
 @st.cache_data(show_spinner=False)
 def load_data() -> pd.DataFrame:
     if not DATA_PATH.exists():
-        st.error(f"CSV not found at: {DATA_PATH}")
+        st.error(f"Dataset not found at: {DATA_PATH}")
         st.stop()
-    return pd.read_csv(DATA_PATH, sep=";")
+
+    df = pd.read_csv(DATA_PATH, sep=";")
+
+    # Normalize whitespace in column names (safe, helps avoid hidden issues)
+    df.columns = [c.strip() for c in df.columns]
+
+    return df
 
 
-def get_target_candidates(df: pd.DataFrame):
-    present_known = [c for c in KNOWN_TARGETS if c in df.columns]
+def detect_targets(df: pd.DataFrame) -> List[str]:
+    # Prefer known CQAs if present
+    present = [c for c in KNOWN_CQA_TARGETS if c in df.columns]
 
-    kw = []
+    # Add keyword-based targets (in case naming differs)
+    keyword_hits: List[str] = []
     for c in df.columns:
         cl = c.lower()
-        if any(k in cl for k in ["impur", "release", "solvent"]):
-            if c not in present_known:
-                kw.append(c)
+        if any(k in cl for k in ["impur", "release", "solvent", "dissol", "hard", "assay", "uniform"]):
+            if c not in present and c not in ID_COLS:
+                keyword_hits.append(c)
 
+    # Fallback: numeric columns not identifiers
     numeric = [c for c in df.select_dtypes(include=[np.number]).columns if c not in ID_COLS]
 
-    ordered = []
-    for c in present_known + kw + numeric:
+    ordered: List[str] = []
+    for c in present + keyword_hits + numeric:
         if c not in ordered and c in df.columns:
             ordered.append(c)
+
+    # Last safety: if still empty, allow any column
+    if not ordered:
+        ordered = [c for c in df.columns if c not in ID_COLS]
+
     return ordered
 
 
-def infer_feature_types(df: pd.DataFrame, target: str):
-    X = df.drop(columns=[target])
-    cat_cols = [c for c in X.columns if X[c].dtype == "object" or str(X[c].dtype) == "category"]
-    num_cols = [c for c in X.columns if c not in cat_cols]
-    return num_cols, cat_cols
+def feature_types(df: pd.DataFrame, target_col: str) -> Tuple[List[str], List[str]]:
+    X = df.drop(columns=[target_col])
+    cat = [c for c in X.columns if X[c].dtype == "object" or str(X[c].dtype) == "category"]
+    num = [c for c in X.columns if c not in cat]
+    return num, cat
 
 
-def build_preprocessor(num_cols, cat_cols, scale_numeric: bool):
-    numeric_steps = [("imputer", SimpleImputer(strategy="median"))]
+def build_preprocessor(num_cols: List[str], cat_cols: List[str], scale_numeric: bool) -> ColumnTransformer:
+    num_steps = [("imputer", SimpleImputer(strategy="median"))]
     if scale_numeric:
-        numeric_steps.append(("scaler", StandardScaler()))
-    numeric_pipe = Pipeline(steps=numeric_steps)
+        num_steps.append(("scaler", StandardScaler()))
+    num_pipe = Pipeline(steps=num_steps)
 
-    cat_pipe = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
-    ])
+    cat_pipe = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+        ]
+    )
 
     return ColumnTransformer(
         transformers=[
-            ("num", numeric_pipe, num_cols),
+            ("num", num_pipe, num_cols),
             ("cat", cat_pipe, cat_cols),
         ],
         remainder="drop",
-        verbose_feature_names_out=False
+        verbose_feature_names_out=False,
     )
 
 
-def get_model(problem_mode: str, model_name: str, random_state: int):
+def get_feature_names(preprocessor: ColumnTransformer) -> List[str]:
+    try:
+        return list(preprocessor.get_feature_names_out())
+    except Exception:
+        return []
+
+
+# -----------------------------
+# Modeling
+# -----------------------------
+def get_model(problem_mode: str, model_name: str, seed: int):
     if problem_mode == "regression":
-        if model_name == "Random Forest (regression)":
-            return RandomForestRegressor(
-                n_estimators=400,
-                random_state=random_state,
-                n_jobs=-1
-            )
-        if model_name == "ElasticNet (regression)":
-            return ElasticNet(random_state=random_state)
+        if model_name == "Random Forest":
+            return RandomForestRegressor(n_estimators=400, random_state=seed, n_jobs=-1)
+        if model_name == "ElasticNet":
+            return ElasticNet(random_state=seed)
         raise ValueError("Unknown regression model")
     else:
-        if model_name == "Random Forest (classification)":
+        if model_name == "Random Forest":
             return RandomForestClassifier(
-                n_estimators=400,
-                random_state=random_state,
-                n_jobs=-1,
-                class_weight="balanced"
+                n_estimators=400, random_state=seed, n_jobs=-1, class_weight="balanced"
             )
-        if model_name == "Logistic Regression (classification)":
-            return LogisticRegression(
-                max_iter=5000,
-                class_weight="balanced"
-            )
+        if model_name == "Logistic Regression":
+            return LogisticRegression(max_iter=5000, class_weight="balanced")
         raise ValueError("Unknown classification model")
 
 
-def regression_metrics(y_true, y_pred):
+@st.cache_data(show_spinner=False)
+def prepare_xy(df: pd.DataFrame, target_col: str) -> Tuple[pd.DataFrame, pd.Series]:
+    data = df.dropna(subset=[target_col]).copy()
+    X = data.drop(columns=[target_col])
+    y = data[target_col].copy()
+    return X, y
+
+
+@st.cache_resource(show_spinner=False)
+def train_pipeline(
+    df: pd.DataFrame,
+    target_col: str,
+    problem_mode: str,
+    model_name: str,
+    test_size: float,
+    seed: int,
+    scale_numeric: bool,
+) -> Tuple[Pipeline, pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
+    X, y = prepare_xy(df, target_col)
+
+    stratify = None
+    if problem_mode == "classification" and y.nunique(dropna=True) <= 20:
+        stratify = y
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=test_size, random_state=seed, stratify=stratify
+    )
+
+    num_cols, cat_cols = feature_types(pd.concat([X, y], axis=1), target_col)
+    pre = build_preprocessor(num_cols, cat_cols, scale_numeric=scale_numeric)
+    model = get_model(problem_mode, model_name, seed)
+
+    pipe = Pipeline(steps=[("preprocessor", pre), ("model", model)])
+    pipe.fit(X_train, y_train)
+
+    return pipe, X_train, X_test, y_train, y_test
+
+
+def regression_metrics(y_true: pd.Series, y_pred: np.ndarray) -> Dict[str, float]:
     rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
     return {
         "R2": float(r2_score(y_true, y_pred)),
         "MAE": float(mean_absolute_error(y_true, y_pred)),
-        "RMSE": rmse
+        "RMSE": rmse,
     }
 
 
-def classification_metrics(y_true, y_pred, y_proba=None):
+def classification_metrics(y_true: pd.Series, y_pred: np.ndarray, y_proba: Optional[np.ndarray]) -> Dict[str, float]:
     out = {"Accuracy": float(accuracy_score(y_true, y_pred))}
-    if y_proba is not None and len(np.unique(y_true)) == 2:
+    if y_proba is not None and y_true.nunique() == 2:
         out["ROC AUC"] = float(roc_auc_score(y_true, y_proba))
     return out
 
 
-def make_correlation_heatmap(df: pd.DataFrame):
+# -----------------------------
+# Plot helpers
+# -----------------------------
+def plot_correlation_heatmap(df: pd.DataFrame):
     num = df.select_dtypes(include=[np.number]).copy()
     if num.shape[1] < 2:
         st.info("Not enough numeric columns for correlation heatmap.")
@@ -145,81 +221,43 @@ def make_correlation_heatmap(df: pd.DataFrame):
     st.plotly_chart(fig, width="stretch")
 
 
-def get_feature_names(preprocessor: ColumnTransformer):
-    try:
-        return list(preprocessor.get_feature_names_out())
-    except Exception:
-        return []
-
-
-@st.cache_data(show_spinner=False)
-def prepare_xy(df: pd.DataFrame, target: str):
-    data = df.dropna(subset=[target]).copy()
-    X = data.drop(columns=[target])
-    y = data[target].copy()
-    return X, y
-
-
-@st.cache_resource(show_spinner=False)
-def train_pipeline(df: pd.DataFrame, target_col: str, problem_mode: str,
-                   test_size: float, random_state: int,
-                   model_name: str, scale_numeric: bool):
-    X, y = prepare_xy(df, target_col)
-
-    stratify = y if (problem_mode == "classification" and y.nunique() <= 20) else None
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=random_state, stratify=stratify
-    )
-
-    num_cols, cat_cols = infer_feature_types(pd.concat([X, y], axis=1), target_col)
-    pre = build_preprocessor(num_cols, cat_cols, scale_numeric=scale_numeric)
-    model = get_model(problem_mode, model_name=model_name, random_state=random_state)
-
-    pipe = Pipeline(steps=[("preprocessor", pre), ("model", model)])
-    pipe.fit(X_train, y_train)
-    return pipe, X_train, X_test, y_train, y_test
-
-
-def permutation_importance_plot(pipe: Pipeline, X_test, y_test, problem_mode: str):
+def plot_feature_importance(pipe: Pipeline, X_test: pd.DataFrame, y_test: pd.Series, problem_mode: str):
     pre = pipe.named_steps["preprocessor"]
-    feature_names = get_feature_names(pre)
-    if not feature_names:
-        st.info("Feature names could not be extracted for importance.")
+    names = get_feature_names(pre)
+    if not names:
+        st.info("Could not extract feature names for importance.")
         return
 
-    if problem_mode == "regression":
-        scoring = "r2"
-    else:
-        scoring = "roc_auc" if y_test.nunique() == 2 else "accuracy"
+    scoring = "r2" if problem_mode == "regression" else ("roc_auc" if y_test.nunique() == 2 else "accuracy")
 
     try:
         r = permutation_importance(
-            pipe, X_test, y_test,
-            n_repeats=15, random_state=0, n_jobs=-1, scoring=scoring
+            pipe, X_test, y_test, n_repeats=12, random_state=0, n_jobs=-1, scoring=scoring
         )
     except Exception as e:
-        st.warning(f"Could not compute permutation importance: {e}")
+        st.warning(f"Permutation importance failed: {e}")
         return
 
-    imp = pd.DataFrame({
-        "feature": feature_names,
-        "importance_mean": r.importances_mean,
-        "importance_std": r.importances_std
-    }).sort_values("importance_mean", ascending=False).head(25)
+    imp = (
+        pd.DataFrame(
+            {"feature": names, "importance_mean": r.importances_mean, "importance_std": r.importances_std}
+        )
+        .sort_values("importance_mean", ascending=False)
+        .head(25)
+    )
 
     fig = px.bar(
-        imp[::-1],
+        imp.iloc[::-1],
         x="importance_mean",
         y="feature",
         orientation="h",
         error_x="importance_std",
-        title="Permutation importance (top 25)"
+        title="Permutation importance (top 25)",
     )
     st.plotly_chart(fig, width="stretch")
 
 
-def prediction_plots(pipe: Pipeline, X_test, y_test, problem_mode: str):
+def plot_predictions(pipe: Pipeline, X_test: pd.DataFrame, y_test: pd.Series, problem_mode: str):
     if problem_mode == "regression":
         y_pred = pipe.predict(X_test)
         met = regression_metrics(y_test, y_pred)
@@ -230,20 +268,20 @@ def prediction_plots(pipe: Pipeline, X_test, y_test, problem_mode: str):
         c3.metric("RMSE", f"{met['RMSE']:.4f}")
 
         dfp = pd.DataFrame({"Actual": y_test.values, "Predicted": y_pred})
-        fig1 = px.scatter(dfp, x="Actual", y="Predicted", trendline="ols", title="Actual vs Predicted")
+        fig1 = px.scatter(dfp, x="Actual", y="Predicted", title="Actual vs Predicted")
         st.plotly_chart(fig1, width="stretch")
 
         resid = y_test.values - y_pred
         fig2 = px.scatter(
-            x=y_pred, y=resid,
+            x=y_pred,
+            y=resid,
             labels={"x": "Predicted", "y": "Residual"},
-            title="Residuals vs Predicted"
+            title="Residuals vs Predicted",
         )
         st.plotly_chart(fig2, width="stretch")
 
     else:
         y_pred = pipe.predict(X_test)
-
         y_proba = None
         if hasattr(pipe, "predict_proba") and y_test.nunique() == 2:
             y_proba = pipe.predict_proba(X_test)[:, 1]
@@ -265,38 +303,19 @@ def prediction_plots(pipe: Pipeline, X_test, y_test, problem_mode: str):
                 pd.DataFrame({"p(out_of_spec)": y_proba}),
                 x="p(out_of_spec)",
                 nbins=30,
-                title="Predicted probability distribution"
+                title="Predicted probability distribution",
             )
             st.plotly_chart(fig2, width="stretch")
 
 
-def make_single_prediction_input(df: pd.DataFrame, target: str):
-    X = df.drop(columns=[target])
-    row = {}
-    for col in X.columns:
-        if X[col].dtype == "object" or str(X[col].dtype) == "category":
-            opts = list(pd.Series(X[col]).dropna().unique())
-            row[col] = st.selectbox(col, options=opts if opts else ["unknown"], index=0)
-        else:
-            s = pd.to_numeric(X[col], errors="coerce")
-            p1 = float(np.nanpercentile(s, 1))
-            p99 = float(np.nanpercentile(s, 99))
-            med = float(np.nanmedian(s))
-            if np.isfinite(p1) and np.isfinite(p99) and p1 != p99:
-                row[col] = st.slider(col, min_value=p1, max_value=p99, value=med)
-            else:
-                row[col] = st.number_input(col, value=med)
-    return pd.DataFrame([row])
-
-
-def contour_explorer(pipe: Pipeline, df: pd.DataFrame, target: str, problem_mode: str):
-    data = df.dropna(subset=[target]).copy()
-    X = data.drop(columns=[target])
-    y = data[target]
+def contour_explorer(pipe: Pipeline, df: pd.DataFrame, target_col: str, problem_mode: str):
+    data = df.dropna(subset=[target_col]).copy()
+    X = data.drop(columns=[target_col])
+    y = data[target_col]
 
     num_cols = list(X.select_dtypes(include=[np.number]).columns)
     if len(num_cols) < 2:
-        st.info("Need at least two numeric features for contour plots.")
+        st.info("Need at least two numeric input features for contour plots.")
         return
 
     c1, c2, c3 = st.columns([1, 1, 1])
@@ -307,15 +326,17 @@ def contour_explorer(pipe: Pipeline, df: pd.DataFrame, target: str, problem_mode
     with c3:
         grid_n = st.slider("Grid resolution", min_value=25, max_value=120, value=60, step=5)
 
-    fixed = {}
+    # Hold other features at median (numeric) / mode (categorical)
+    fixed: Dict[str, object] = {}
     for col in X.columns:
-        if col in [x_feat, y_feat]:
+        if col in (x_feat, y_feat):
             continue
         if X[col].dtype == "object" or str(X[col].dtype) == "category":
-            fixed[col] = pd.Series(X[col]).dropna().mode().iloc[0] if X[col].dropna().shape[0] else "unknown"
+            fixed[col] = X[col].dropna().mode().iloc[0] if X[col].dropna().shape[0] else "unknown"
         else:
             fixed[col] = float(pd.to_numeric(X[col], errors="coerce").median())
 
+    # grid ranges based on 1st and 99th percentiles
     x_vals = pd.to_numeric(X[x_feat], errors="coerce").dropna().values
     y_vals = pd.to_numeric(X[y_feat], errors="coerce").dropna().values
     x_min, x_max = np.nanpercentile(x_vals, [1, 99])
@@ -331,7 +352,7 @@ def contour_explorer(pipe: Pipeline, df: pd.DataFrame, target: str, problem_mode
 
     if problem_mode == "regression":
         Z = pipe.predict(grid).reshape(YY.shape)
-        z_title = f"Predicted {target}"
+        z_title = f"Predicted {target_col}"
     else:
         if hasattr(pipe, "predict_proba") and y.nunique() == 2:
             Z = pipe.predict_proba(grid)[:, 1].reshape(YY.shape)
@@ -343,101 +364,134 @@ def contour_explorer(pipe: Pipeline, df: pd.DataFrame, target: str, problem_mode
     fig = go.Figure()
     fig.add_trace(go.Contour(x=gx, y=gy, z=Z, contours_coloring="heatmap", colorbar_title=z_title))
 
+    # Overlay observed points (sample)
     sample_n = min(600, len(X))
     rng = np.random.default_rng(0)
     idx = rng.choice(len(X), size=sample_n, replace=False)
-    fig.add_trace(go.Scatter(
-        x=pd.to_numeric(X.iloc[idx][x_feat], errors="coerce"),
-        y=pd.to_numeric(X.iloc[idx][y_feat], errors="coerce"),
-        mode="markers",
-        marker=dict(size=5),
-        name="Observed batches"
-    ))
+    fig.add_trace(
+        go.Scatter(
+            x=pd.to_numeric(X.iloc[idx][x_feat], errors="coerce"),
+            y=pd.to_numeric(X.iloc[idx][y_feat], errors="coerce"),
+            mode="markers",
+            marker=dict(size=5),
+            name="Observed batches",
+        )
+    )
 
     fig.update_layout(
         title=f"Contour explorer: {x_feat} vs {y_feat}",
         xaxis_title=x_feat,
         yaxis_title=y_feat,
-        height=650
+        height=650,
     )
     st.plotly_chart(fig, width="stretch")
-    st.caption("Contour computed with other features held at median (numeric) or mode (categorical).")
+    st.caption("Other features held at median (numeric) or mode (categorical).")
 
 
+# -----------------------------
+# Single prediction
+# -----------------------------
+def single_input_form(df: pd.DataFrame, target_col: str) -> pd.DataFrame:
+    X = df.drop(columns=[target_col])
+    row: Dict[str, object] = {}
+
+    st.write("Adjust process/material parameters and get an instant model prediction.")
+
+    for col in X.columns:
+        if X[col].dtype == "object" or str(X[col].dtype) == "category":
+            opts = list(pd.Series(X[col]).dropna().unique())
+            row[col] = st.selectbox(col, options=opts if opts else ["unknown"], index=0)
+        else:
+            s = pd.to_numeric(X[col], errors="coerce")
+            p1 = float(np.nanpercentile(s, 1))
+            p99 = float(np.nanpercentile(s, 99))
+            med = float(np.nanmedian(s))
+            if np.isfinite(p1) and np.isfinite(p99) and p1 != p99:
+                row[col] = st.slider(col, min_value=p1, max_value=p99, value=med)
+            else:
+                row[col] = st.number_input(col, value=med)
+
+    return pd.DataFrame([row])
+
+
+# -----------------------------
+# Main
+# -----------------------------
 def main():
-    st.title("Machine learning prediction of tablet quality attributes")
+    st.title("PharmaQualityAI: tablet quality prediction from manufacturing data")
 
     df = load_data()
 
+    targets = detect_targets(df)
+    cqa_present = [c for c in KNOWN_CQA_TARGETS if c in df.columns]
+
     with st.sidebar:
-        st.header("Data")
-        st.caption(f"Loaded dataset from: {DATA_PATH.name}")
+        st.header("Dataset")
+        st.write(f"Loaded: {DATA_FILENAME}")
+        st.write(f"Rows: {df.shape[0]}  Columns: {df.shape[1]}")
 
-        st.header("Targets detected in your file")
-        targets = get_target_candidates(df)
+        st.header("Targets")
+        if cqa_present:
+            st.write("CQA targets detected:")
+            st.write(cqa_present)
+        else:
+            st.write("No standard CQA names detected. Using numeric columns as candidates.")
 
-        cqa_present = [c for c in KNOWN_TARGETS if c in df.columns]
-        st.write("CQA columns found:")
-        st.write(cqa_present if cqa_present else "None found (unexpected for your file).")
-
-        default_target = (
-            "Drug release average (%)"
-            if "Drug release average (%)" in targets
-            else (cqa_present[0] if cqa_present else targets[0])
-        )
-        target = st.selectbox(
-            "Choose target (what you want to predict)",
-            options=targets,
-            index=targets.index(default_target)
-        )
+        default_target = "Drug release average (%)" if "Drug release average (%)" in targets else targets[0]
+        target = st.selectbox("Select target", options=targets, index=targets.index(default_target))
 
         st.header("Objective")
-        objective = st.radio("Type", options=["Regression", "Classification (out-of-spec)"])
+        objective = st.radio("Mode", options=["Regression", "Classification (out-of-spec)"])
         problem_mode = "regression" if objective == "Regression" else "classification"
 
-        lower_spec, upper_spec = None, None
+        # Classification spec limits
+        lower_spec = np.nan
+        upper_spec = np.nan
         if problem_mode == "classification":
-            st.subheader("Specification limits")
-            st.write("Label: 1 = out-of-spec, 0 = within-spec")
+            st.subheader("Spec limits")
+            st.write("Label: 1 = out-of-spec, 0 = within spec")
             colA, colB = st.columns(2)
             with colA:
                 lower_spec = st.number_input("Lower spec (optional)", value=float("nan"))
             with colB:
                 upper_spec = st.number_input("Upper spec (optional)", value=float("nan"))
 
-        st.header("Training")
-        model_name = st.selectbox(
-            "Model",
-            options=(["Random Forest (regression)", "ElasticNet (regression)"]
-                     if problem_mode == "regression"
-                     else ["Random Forest (classification)", "Logistic Regression (classification)"])
-        )
+        st.header("Model")
+        if problem_mode == "regression":
+            model_name = st.selectbox("Algorithm", options=["Random Forest", "ElasticNet"], index=0)
+        else:
+            model_name = st.selectbox("Algorithm", options=["Random Forest", "Logistic Regression"], index=0)
+
         test_size = st.slider("Test size", 0.1, 0.4, 0.2, 0.05)
-        random_state = st.number_input("Random seed", value=42, step=1)
+        seed = st.number_input("Random seed", value=42, step=1)
+
         scale_numeric = st.checkbox(
-            "Scale numeric features (useful for linear models)",
-            value=(model_name.startswith("ElasticNet") or model_name.startswith("Logistic"))
+            "Scale numeric features",
+            value=(model_name in {"ElasticNet", "Logistic Regression"}),
         )
 
-    # Prepare working dataframe
+    # Build working dataframe (classification adds a label column)
     work_df = df.copy()
 
     if problem_mode == "classification":
         y_num = pd.to_numeric(work_df[target], errors="coerce")
 
-        label = pd.Series(0, index=work_df.index, dtype="int64")
-        if lower_spec is not None and np.isfinite(lower_spec):
-            label = label | (y_num < lower_spec).astype(int)
-        if upper_spec is not None and np.isfinite(upper_spec):
-            label = label | (y_num > upper_spec).astype(int)
+        # If no limits provided, auto-define abnormal batches using robust threshold
+        no_limits = (not np.isfinite(lower_spec)) and (not np.isfinite(upper_spec))
 
-        if (lower_spec is None or not np.isfinite(lower_spec)) and (upper_spec is None or not np.isfinite(upper_spec)):
+        if no_limits:
             med = float(np.nanmedian(y_num))
             mad = float(np.nanmedian(np.abs(y_num - med)))
             thr = 3.0 * mad if mad > 0 else float(np.nanstd(y_num))
             if not np.isfinite(thr) or thr == 0:
                 thr = float(np.nanstd(y_num)) if np.isfinite(np.nanstd(y_num)) else 1.0
             label = (np.abs(y_num - med) > thr).astype(int)
+        else:
+            label = pd.Series(0, index=work_df.index, dtype="int64")
+            if np.isfinite(lower_spec):
+                label = label | (y_num < lower_spec).astype(int)
+            if np.isfinite(upper_spec):
+                label = label | (y_num > upper_spec).astype(int)
 
         work_df["__out_of_spec__"] = label
         target_col = "__out_of_spec__"
@@ -452,55 +506,51 @@ def main():
 
         st.subheader("Missing values")
         mv = df.isna().sum().sort_values(ascending=False)
-        st.dataframe(mv[mv > 0].to_frame("missing_count"), width="stretch")
+        mv = mv[mv > 0]
+        if len(mv) == 0:
+            st.write("No missing values detected.")
+        else:
+            st.dataframe(mv.to_frame("missing_count"), width="stretch")
 
-        st.subheader("Interactive distribution")
-        numeric_cols = list(df.select_dtypes(include=[np.number]).columns)
-        if numeric_cols:
-            col = st.selectbox(
-                "Column for distribution plot",
-                options=numeric_cols,
-                index=numeric_cols.index(target) if target in numeric_cols else 0
-            )
+        st.subheader("Distribution")
+        num_cols = list(df.select_dtypes(include=[np.number]).columns)
+        if num_cols:
+            col = st.selectbox("Column", options=num_cols, index=num_cols.index(target) if target in num_cols else 0)
             fig = px.histogram(df, x=col, nbins=40, title=f"Distribution: {col}")
             st.plotly_chart(fig, width="stretch")
 
         st.subheader("Correlations")
-        make_correlation_heatmap(df)
+        plot_correlation_heatmap(df)
 
-    # IMPORTANT FIX:
-    # Train on work_df (which contains __out_of_spec__ if classification)
+    # Train pipeline
     pipe, X_train, X_test, y_train, y_test = train_pipeline(
         df=work_df,
         target_col=target_col,
         problem_mode=problem_mode,
-        test_size=float(test_size),
-        random_state=int(random_state),
         model_name=model_name,
-        scale_numeric=scale_numeric
+        test_size=float(test_size),
+        seed=int(seed),
+        scale_numeric=scale_numeric,
     )
 
     with tabs[1]:
-        st.subheader("Performance on hold-out test set")
-        prediction_plots(pipe, X_test, y_test, problem_mode)
+        st.subheader("Hold-out performance")
+        plot_predictions(pipe, X_test, y_test, problem_mode)
 
-        st.subheader("Feature importance")
-        permutation_importance_plot(pipe, X_test, y_test, problem_mode)
+        st.subheader("What drives predictions")
+        plot_feature_importance(pipe, X_test, y_test, problem_mode)
 
     with tabs[2]:
         st.subheader("What-if prediction")
-
         if problem_mode == "regression":
-            st.write(f"Predicting: {target}")
-            input_df = make_single_prediction_input(work_df, target)
+            st.write(f"Target: {target}")
+            input_df = single_input_form(work_df, target_col)
             pred = float(pipe.predict(input_df)[0])
             st.metric("Predicted value", f"{pred:.4f}")
         else:
-            st.write(f"Predicting out-of-spec risk label derived from: {target}")
-            # do NOT include target_col in the inputs
-            input_df = make_single_prediction_input(work_df, target_col)
-
-            if hasattr(pipe, "predict_proba"):
+            st.write(f"Risk label derived from: {target}")
+            input_df = single_input_form(work_df, target_col)
+            if hasattr(pipe, "predict_proba") and y_test.nunique() == 2:
                 p = float(pipe.predict_proba(input_df)[0, 1])
                 st.metric("Predicted p(out_of_spec)", f"{p:.4f}")
                 st.metric("Predicted label (threshold 0.5)", str(int(p >= 0.5)))
@@ -509,13 +559,8 @@ def main():
                 st.metric("Predicted label", str(cls))
 
     with tabs[3]:
-        st.subheader("Contour-based process exploration")
-        contour_explorer(
-            pipe=pipe,
-            df=work_df,
-            target=target_col,
-            problem_mode=problem_mode
-        )
+        st.subheader("Contour explorer")
+        contour_explorer(pipe, work_df, target_col, problem_mode)
 
 
 if __name__ == "__main__":
