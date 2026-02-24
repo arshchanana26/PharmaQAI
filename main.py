@@ -91,65 +91,111 @@ st.markdown(f"""
 <style>
   @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600&display=swap');
 
-  html, body, [class*="css"] {{
-      font-family: 'IBM Plex Sans', sans-serif;
-      background-color: {PALETTE['bg']};
-      color: {PALETTE['text']};
+  /* ── ROOT & BODY ── */
+  html, body {{
+      background-color: {PALETTE['bg']} !important;
+      color: {PALETTE['text']} !important;
+      font-family: 'IBM Plex Sans', sans-serif !important;
   }}
-  .block-container {{ padding: 1.5rem 2rem 3rem 2rem; max-width: 1400px; }}
-  section[data-testid="stSidebar"] {{
-      background-color: {PALETTE['panel']};
-      border-right: 1px solid {PALETTE['border']};
+
+  /* ── EVERY STREAMLIT WRAPPER ── */
+  .stApp, .stApp > div, .main, .main > div,
+  [data-testid="stAppViewContainer"],
+  [data-testid="stAppViewBlockContainer"],
+  [data-testid="stVerticalBlock"],
+  [data-testid="stHorizontalBlock"],
+  [data-testid="column"],
+  .block-container {{
+      background-color: {PALETTE['bg']} !important;
+      color: {PALETTE['text']} !important;
   }}
-  /* Force ALL text white/light everywhere */
-  *, *::before, *::after {{
-      color: {PALETTE['text']};
+  .block-container {{ padding: 1.5rem 2rem 3rem 2rem !important; max-width: 1400px !important; }}
+
+  /* ── SIDEBAR ── */
+  section[data-testid="stSidebar"],
+  section[data-testid="stSidebar"] > div {{
+      background-color: {PALETTE['panel']} !important;
+      border-right: 1px solid {PALETTE['border']} !important;
+  }}
+
+  /* ── ALL TEXT EVERYWHERE ── */
+  *, p, span, div, label, li, td, th, h1, h2, h3, h4, h5, h6 {{
+      color: {PALETTE['text']} !important;
+      font-family: 'IBM Plex Sans', sans-serif !important;
   }}
   h1, h2, h3 {{
-      font-family: 'IBM Plex Mono', monospace;
-      letter-spacing: -0.03em;
-      color: {PALETTE['text']} !important;
+      font-family: 'IBM Plex Mono', monospace !important;
+      letter-spacing: -0.03em !important;
   }}
 
-  /* Sidebar — every element forced light */
-  section[data-testid="stSidebar"] * {{
+  /* ── WIDGETS: SELECT / MULTISELECT ── */
+  div[data-baseweb="select"] > div,
+  div[data-baseweb="select"] input,
+  div[data-baseweb="select"] span,
+  div[data-baseweb="popover"] li,
+  div[data-baseweb="popover"] span,
+  div[data-baseweb="popover"] div,
+  [data-testid="stSelectbox"] *,
+  [data-testid="stMultiSelect"] * {{
+      background-color: {PALETTE['panel']} !important;
+      color: {PALETTE['text']} !important;
+      border-color: {PALETTE['border']} !important;
+  }}
+  /* Dropdown list items hover */
+  div[data-baseweb="menu"] li:hover,
+  div[data-baseweb="popover"] li:hover {{
+      background-color: {PALETTE['border']} !important;
+  }}
+  /* Selected tags in multiselect */
+  [data-baseweb="tag"] {{
+      background-color: {PALETTE['border']} !important;
+  }}
+  [data-baseweb="tag"] span {{
+      color: {PALETTE['accent1']} !important;
+  }}
+
+  /* ── SLIDERS ── */
+  [data-testid="stSlider"] * {{
       color: {PALETTE['text']} !important;
   }}
-  section[data-testid="stSidebar"] p,
-  section[data-testid="stSidebar"] span,
-  section[data-testid="stSidebar"] label,
-  section[data-testid="stSidebar"] div {{
-      color: {PALETTE['text']} !important;
+  div[data-baseweb="slider"] div[role="slider"] {{
+      background-color: {PALETTE['accent1']} !important;
   }}
-  /* Radio labels */
+
+  /* ── FILE UPLOADER ── */
+  [data-testid="stFileUploader"],
+  [data-testid="stFileUploader"] * {{
+      background-color: {PALETTE['panel']} !important;
+      color: {PALETTE['text']} !important;
+      border-color: {PALETTE['border']} !important;
+  }}
+
+  /* ── RADIO ── */
   div[role="radiogroup"] label p,
-  div[role="radiogroup"] label span {{
-      color: {PALETTE['text']} !important;
-  }}
-  /* File uploader inner text */
-  .stFileUploader span, .stFileUploader p, .stFileUploader label {{
+  div[role="radiogroup"] label span,
+  div[role="radiogroup"] * {{
       color: {PALETTE['text']} !important;
   }}
 
-  /* Widget labels everywhere */
-  label, .stSelectbox label p, .stMultiSelect label p,
-  .stSlider label p, .stTextInput label p {{
+  /* ── DATAFRAME / TABLE ── */
+  [data-testid="stDataFrame"],
+  [data-testid="stDataFrame"] *,
+  .stDataFrame, .stDataFrame * {{
+      background-color: {PALETTE['panel']} !important;
       color: {PALETTE['text']} !important;
-  }}
-  /* Selectbox selected value text */
-  div[data-baseweb="select"] span {{
-      color: {PALETTE['text']} !important;
+      border-color: {PALETTE['border']} !important;
   }}
 
+  /* ── METRIC CARDS (custom) ── */
   .metric-card {{
-      background: {PALETTE['panel']};
+      background: {PALETTE['panel']} !important;
       border: 1px solid {PALETTE['border']};
       border-radius: 8px;
       padding: 1rem 1.25rem;
       margin-bottom: 0.5rem;
   }}
   .metric-value {{
-      font-family: 'IBM Plex Mono', monospace;
+      font-family: 'IBM Plex Mono', monospace !important;
       font-size: 1.6rem;
       color: {PALETTE['accent1']} !important;
   }}
@@ -159,30 +205,44 @@ st.markdown(f"""
       text-transform: uppercase;
       letter-spacing: 0.08em;
   }}
+
+  /* ── TAGS ── */
   .tag {{
       display: inline-block;
-      background: {PALETTE['border']};
+      background: {PALETTE['border']} !important;
       color: {PALETTE['accent1']} !important;
-      font-family: 'IBM Plex Mono', monospace;
+      font-family: 'IBM Plex Mono', monospace !important;
       font-size: 0.7rem;
       padding: 2px 8px;
       border-radius: 12px;
       margin: 2px;
   }}
-  hr {{ border-color: {PALETTE['border']}; }}
+
+  /* ── DIVIDERS ── */
+  hr {{ border-color: {PALETTE['border']} !important; }}
+
+  /* ── BUTTON ── */
   .stButton > button {{
-      background: {PALETTE['accent1']};
+      background: {PALETTE['accent1']} !important;
       color: {PALETTE['bg']} !important;
-      border: none;
+      border: none !important;
       border-radius: 6px;
-      font-family: 'IBM Plex Mono', monospace;
+      font-family: 'IBM Plex Mono', monospace !important;
       font-size: 0.8rem;
       font-weight: 600;
       padding: 0.45rem 1.2rem;
       transition: opacity 0.15s;
   }}
-  .stButton > button:hover {{ opacity: 0.85; }}
-  .stAlert p {{ color: {PALETTE['text']} !important; }}
+  .stButton > button:hover {{ opacity: 0.85 !important; }}
+  .stButton > button * {{ color: {PALETTE['bg']} !important; }}
+
+  /* ── ALERTS / WARNINGS ── */
+  .stAlert, .stAlert * {{ color: {PALETTE['text']} !important; }}
+
+  /* ── SCROLLBARS ── */
+  ::-webkit-scrollbar {{ width: 6px; height: 6px; }}
+  ::-webkit-scrollbar-track {{ background: {PALETTE['bg']}; }}
+  ::-webkit-scrollbar-thumb {{ background: {PALETTE['border']}; border-radius: 3px; }}
 </style>
 """, unsafe_allow_html=True)
 
