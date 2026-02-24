@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -21,7 +23,8 @@ import plotly.graph_objects as go
 
 st.set_page_config(page_title="Tablet Quality Prediction", layout="wide")
 
-DEFAULT_PATH = "Process (1).csv"
+# Load from repo folder reliably (works on Streamlit Cloud)
+DATA_PATH = Path(__file__).resolve().parent / "Process (1).csv"
 
 KNOWN_TARGETS = [
     "Drug release average (%)",
@@ -34,25 +37,26 @@ KNOWN_TARGETS = [
 ID_COLS = ["batch", "code"]
 
 
-def load_data(uploaded_file) -> pd.DataFrame:
-    if uploaded_file is not None:
-        return pd.read_csv(uploaded_file, sep=";")
-    return pd.read_csv(DEFAULT_PATH, sep=";")
+@st.cache_data(show_spinner=False)
+def load_data() -> pd.DataFrame:
+    if not DATA_PATH.exists():
+        st.error(f"CSV not found at: {DATA_PATH}")
+        st.stop()
+    return pd.read_csv(DATA_PATH, sep=";")
 
 
 def get_target_candidates(df: pd.DataFrame):
-    # Prefer known CQA columns if present
     present_known = [c for c in KNOWN_TARGETS if c in df.columns]
-    # Also include any columns with "impur", "release", "solvent" keywords
+
     kw = []
     for c in df.columns:
         cl = c.lower()
         if any(k in cl for k in ["impur", "release", "solvent"]):
             if c not in present_known:
                 kw.append(c)
-    # Fallback: any numeric column not an ID
+
     numeric = [c for c in df.select_dtypes(include=[np.number]).columns if c not in ID_COLS]
-    # Build ordered unique list
+
     ordered = []
     for c in present_known + kw + numeric:
         if c not in ordered and c in df.columns:
@@ -138,7 +142,7 @@ def make_correlation_heatmap(df: pd.DataFrame):
         return
     corr = num.corr(numeric_only=True)
     fig = px.imshow(corr, aspect="auto", title="Correlation heatmap (numeric columns)")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 def get_feature_names(preprocessor: ColumnTransformer):
@@ -162,7 +166,6 @@ def train_pipeline(df: pd.DataFrame, target_col: str, problem_mode: str,
                    model_name: str, scale_numeric: bool):
     X, y = prepare_xy(df, target_col)
 
-    # stratify only for classification, if few classes
     stratify = y if (problem_mode == "classification" and y.nunique() <= 20) else None
 
     X_train, X_test, y_train, y_test = train_test_split(
@@ -213,7 +216,7 @@ def permutation_importance_plot(pipe: Pipeline, X_test, y_test, problem_mode: st
         error_x="importance_std",
         title="Permutation importance (top 25)"
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 def prediction_plots(pipe: Pipeline, X_test, y_test, problem_mode: str):
@@ -228,7 +231,7 @@ def prediction_plots(pipe: Pipeline, X_test, y_test, problem_mode: str):
 
         dfp = pd.DataFrame({"Actual": y_test.values, "Predicted": y_pred})
         fig1 = px.scatter(dfp, x="Actual", y="Predicted", trendline="ols", title="Actual vs Predicted")
-        st.plotly_chart(fig1, use_container_width=True)
+        st.plotly_chart(fig1, width="stretch")
 
         resid = y_test.values - y_pred
         fig2 = px.scatter(
@@ -236,7 +239,7 @@ def prediction_plots(pipe: Pipeline, X_test, y_test, problem_mode: str):
             labels={"x": "Predicted", "y": "Residual"},
             title="Residuals vs Predicted"
         )
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width="stretch")
 
     else:
         y_pred = pipe.predict(X_test)
@@ -255,7 +258,7 @@ def prediction_plots(pipe: Pipeline, X_test, y_test, problem_mode: str):
 
         cm = confusion_matrix(y_test, y_pred)
         fig = px.imshow(cm, text_auto=True, title="Confusion matrix")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
         if y_proba is not None:
             fig2 = px.histogram(
@@ -264,7 +267,7 @@ def prediction_plots(pipe: Pipeline, X_test, y_test, problem_mode: str):
                 nbins=30,
                 title="Predicted probability distribution"
             )
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(fig2, width="stretch")
 
 
 def make_single_prediction_input(df: pd.DataFrame, target: str):
@@ -340,7 +343,6 @@ def contour_explorer(pipe: Pipeline, df: pd.DataFrame, target: str, problem_mode
     fig = go.Figure()
     fig.add_trace(go.Contour(x=gx, y=gy, z=Z, contours_coloring="heatmap", colorbar_title=z_title))
 
-    # Overlay observed points (sample)
     sample_n = min(600, len(X))
     rng = np.random.default_rng(0)
     idx = rng.choice(len(X), size=sample_n, replace=False)
@@ -358,29 +360,36 @@ def contour_explorer(pipe: Pipeline, df: pd.DataFrame, target: str, problem_mode
         yaxis_title=y_feat,
         height=650
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
     st.caption("Contour computed with other features held at median (numeric) or mode (categorical).")
 
 
 def main():
     st.title("Machine learning prediction of tablet quality attributes")
 
+    df = load_data()
+
     with st.sidebar:
         st.header("Data")
-        uploaded = st.file_uploader("Upload CSV (semicolon-separated)", type=["csv"])
-        df = load_data(uploaded)
+        st.caption(f"Loaded dataset from: {DATA_PATH.name}")
 
         st.header("Targets detected in your file")
         targets = get_target_candidates(df)
 
-        # Show the CQA targets clearly
         cqa_present = [c for c in KNOWN_TARGETS if c in df.columns]
         st.write("CQA columns found:")
         st.write(cqa_present if cqa_present else "None found (unexpected for your file).")
 
-        # pick default target: Drug release average (%), else first CQA, else first candidate
-        default_target = "Drug release average (%)" if "Drug release average (%)" in targets else (cqa_present[0] if cqa_present else targets[0])
-        target = st.selectbox("Choose target (what you want to predict)", options=targets, index=targets.index(default_target))
+        default_target = (
+            "Drug release average (%)"
+            if "Drug release average (%)" in targets
+            else (cqa_present[0] if cqa_present else targets[0])
+        )
+        target = st.selectbox(
+            "Choose target (what you want to predict)",
+            options=targets,
+            index=targets.index(default_target)
+        )
 
         st.header("Objective")
         objective = st.radio("Type", options=["Regression", "Classification (out-of-spec)"])
@@ -413,16 +422,15 @@ def main():
     # Prepare working dataframe
     work_df = df.copy()
 
-    # For classification: create binary out-of-spec label from chosen numeric target
     if problem_mode == "classification":
         y_num = pd.to_numeric(work_df[target], errors="coerce")
+
         label = pd.Series(0, index=work_df.index, dtype="int64")
         if lower_spec is not None and np.isfinite(lower_spec):
             label = label | (y_num < lower_spec).astype(int)
         if upper_spec is not None and np.isfinite(upper_spec):
             label = label | (y_num > upper_spec).astype(int)
 
-        # If user didn't enter any specs, fallback to a robust "abnormal" definition
         if (lower_spec is None or not np.isfinite(lower_spec)) and (upper_spec is None or not np.isfinite(upper_spec)):
             med = float(np.nanmedian(y_num))
             mad = float(np.nanmedian(np.abs(y_num - med)))
@@ -440,24 +448,30 @@ def main():
 
     with tabs[0]:
         st.subheader("Preview")
-        st.dataframe(df.head(20), use_container_width=True)
+        st.dataframe(df.head(20), width="stretch")
 
         st.subheader("Missing values")
         mv = df.isna().sum().sort_values(ascending=False)
-        st.dataframe(mv[mv > 0].to_frame("missing_count"), use_container_width=True)
+        st.dataframe(mv[mv > 0].to_frame("missing_count"), width="stretch")
 
         st.subheader("Interactive distribution")
         numeric_cols = list(df.select_dtypes(include=[np.number]).columns)
-        col = st.selectbox("Column for distribution plot", options=numeric_cols, index=numeric_cols.index(target) if target in numeric_cols else 0)
-        fig = px.histogram(df, x=col, nbins=40, title=f"Distribution: {col}")
-        st.plotly_chart(fig, use_container_width=True)
+        if numeric_cols:
+            col = st.selectbox(
+                "Column for distribution plot",
+                options=numeric_cols,
+                index=numeric_cols.index(target) if target in numeric_cols else 0
+            )
+            fig = px.histogram(df, x=col, nbins=40, title=f"Distribution: {col}")
+            st.plotly_chart(fig, width="stretch")
 
         st.subheader("Correlations")
         make_correlation_heatmap(df)
 
-    # Train model
+    # IMPORTANT FIX:
+    # Train on work_df (which contains __out_of_spec__ if classification)
     pipe, X_train, X_test, y_train, y_test = train_pipeline(
-        work_df.drop(columns=[target]) if (problem_mode == "classification") else work_df,
+        df=work_df,
         target_col=target_col,
         problem_mode=problem_mode,
         test_size=float(test_size),
@@ -475,21 +489,17 @@ def main():
 
     with tabs[2]:
         st.subheader("What-if prediction")
+
         if problem_mode == "regression":
             st.write(f"Predicting: {target}")
-        else:
-            st.write(f"Predicting out-of-spec risk label derived from: {target}")
-
-        base_df = work_df.copy()
-        if problem_mode == "classification":
-            base_df = base_df.drop(columns=["__out_of_spec__"])
-
-        input_df = make_single_prediction_input(base_df, target if problem_mode == "regression" else target)
-
-        if problem_mode == "regression":
+            input_df = make_single_prediction_input(work_df, target)
             pred = float(pipe.predict(input_df)[0])
             st.metric("Predicted value", f"{pred:.4f}")
         else:
+            st.write(f"Predicting out-of-spec risk label derived from: {target}")
+            # do NOT include target_col in the inputs
+            input_df = make_single_prediction_input(work_df, target_col)
+
             if hasattr(pipe, "predict_proba"):
                 p = float(pipe.predict_proba(input_df)[0, 1])
                 st.metric("Predicted p(out_of_spec)", f"{p:.4f}")
@@ -502,7 +512,7 @@ def main():
         st.subheader("Contour-based process exploration")
         contour_explorer(
             pipe=pipe,
-            df=work_df.drop(columns=[target]) if problem_mode == "classification" else work_df,
+            df=work_df,
             target=target_col,
             problem_mode=problem_mode
         )
